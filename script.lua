@@ -2,6 +2,7 @@
 -- LocalScript -> StarterPlayer > StarterPlayerScripts
 -- Функции: Auto Farm Doors, Instant E, Fly (настраиваемый бинд), Player ESP (дистанция + HP), Door ESP (таймер)
 -- RightShift — открыть/скрыть меню, бинд полёта меняется во вкладке Main
+-- Настройки автоматически сохраняются для каждого игрока (файл EjejHuesosHub_<UserId>.json)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -10,6 +11,7 @@ local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local Debris = game:GetService("Debris")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -44,6 +46,52 @@ local Config = {
 if #Config.AllowedUserIds > 0 and not table.find(Config.AllowedUserIds, LocalPlayer.UserId) then
 	return
 end
+
+-- ============================================================
+-- SAVE / LOAD (автосохранение настроек для каждого игрока)
+-- ============================================================
+local SAVE_FILE = "EjejHuesosHub_" .. LocalPlayer.UserId .. ".json"
+local SAVE_KEYS = {
+	"PlayerESP", "SkillESP", "DoorESP", "InstantE", "AutoFarm", "Fly",
+	"FlySpeed", "FarmDelay", "FarmSpeed", "WaitRadius",
+}
+local canFile = (writefile ~= nil and readfile ~= nil and isfile ~= nil)
+
+local function serializeConfig()
+	local data = { FlyKey = Config.FlyKey.Name }
+	for _, k in ipairs(SAVE_KEYS) do data[k] = Config[k] end
+	return HttpService:JSONEncode(data)
+end
+
+local function loadSettings()
+	if not canFile or not isfile(SAVE_FILE) then return end
+	local ok, data = pcall(function() return HttpService:JSONDecode(readfile(SAVE_FILE)) end)
+	if not ok or type(data) ~= "table" then return end
+	for _, k in ipairs(SAVE_KEYS) do
+		if data[k] ~= nil and type(data[k]) == type(Config[k]) then
+			Config[k] = data[k]
+		end
+	end
+	if type(data.FlyKey) == "string" then
+		local okKey, key = pcall(function() return Enum.KeyCode[data.FlyKey] end)
+		if okKey and key then Config.FlyKey = key end
+	end
+end
+
+loadSettings()
+
+-- раз в секунду проверяем, изменились ли настройки, и пишем файл
+local lastSaved = serializeConfig()
+task.spawn(function()
+	while task.wait(1) do
+		if canFile then
+			local cur = serializeConfig()
+			if cur ~= lastSaved and pcall(writefile, SAVE_FILE, cur) then
+				lastSaved = cur
+			end
+		end
+	end
+end)
 
 local Theme = {
 	Bg = Color3.fromRGB(10, 8, 18),
@@ -268,7 +316,7 @@ end)
 -- ============================================================
 -- SKILL ESP (ульта / эвейсив / скилы)
 -- Читаем Attributes и Value-объекты игрока и персонажа + Tool в рюкзаке.
--- Если в игре названия другие — подправь SkillPatterns или нажми "Dump Info"
+-- Если в игре названия другие — подправь SkillPatterns или проверь имена в Explorer
 -- и посмотри имена в консоли (F9).
 -- ============================================================
 local SkillPatterns = {
@@ -518,27 +566,46 @@ local function secondsLeft(readyAt)
 	return l
 end
 
+local READY_ATTRS = { "ReadyAt", "ReadyTime", "CooldownEnd", "CooldownEndsAt", "EndTime", "NextUse" }
+
+local function readyAttr(v)
+	for _, n in ipairs(READY_ATTRS) do
+		local x = v:GetAttribute(n)
+		if type(x) == "number" then return x end
+	end
+	-- длительность + время использования
+	local lu = v:GetAttribute("LastUse")
+	local cd = v:GetAttribute("Cooldown") or v:GetAttribute("CD")
+	if type(lu) == "number" and type(cd) == "number" and cd > 0 then return lu + cd end
+	return nil
+end
+
+local function entryFromInst(v)
+	local ra = readyAttr(v)
+	local lu = v:GetAttribute("LastUse")
+	local key = v:GetAttribute("Key")
+	local total
+	if type(ra) == "number" and type(lu) == "number" and ra > lu then total = ra - lu end
+	if not total and v:IsA("ValueBase") and type(v.Value) == "number" and v.Value > 0 then total = v.Value end
+	local left = type(ra) == "number" and secondsLeft(ra) or 0
+	return {
+		inst = v,
+		name = v.Name,
+		key = key ~= nil and tostring(key) or nil,
+		order = tonumber(key) or 99,
+		left = left,
+		total = total,
+		cd = left > 0.05,
+	}
+end
+
 local function movesetList(char)
 	local folder = char and char:FindFirstChild("Moveset")
 	if not folder then return nil end
 	local list = {}
 	for _, v in ipairs(folder:GetChildren()) do
-		if #list >= 6 then break end
-		local ra = v:GetAttribute("ReadyAt")
-		local lu = v:GetAttribute("LastUse")
-		local key = v:GetAttribute("Key")
-		local total
-		if type(ra) == "number" and type(lu) == "number" and ra > lu then total = ra - lu end
-		if not total and v:IsA("ValueBase") and type(v.Value) == "number" and v.Value > 0 then total = v.Value end
-		local left = type(ra) == "number" and secondsLeft(ra) or 0
-		list[#list + 1] = {
-			name = v.Name,
-			key = key ~= nil and tostring(key) or nil,
-			order = tonumber(key) or 99,
-			left = left,
-			total = total,
-			cd = left > 0.05,
-		}
+		if #list >= 8 then break end
+		list[#list + 1] = entryFromInst(v)
 	end
 	table.sort(list, function(a, b)
 		if a.order ~= b.order then return a.order < b.order end
@@ -589,75 +656,40 @@ local function ensureBox(d, i)
 	return b
 end
 
+local function paintBox(d, b, sk, label)
+	b.row.Visible = true
+	b.name.Text = label
+	if not sk then
+		-- кулдаун не найден: серый квадрат
+		b.fill.Size = UDim2.new(1, 0, 0, 0)
+		b.stroke.Color = Color3.fromRGB(150, 150, 150)
+		return
+	end
+	if sk.cd and sk.left and sk.left > 0.05 then
+		local total = sk.total
+		if not total then
+			total = math.max(d.maxCd[sk.name] or 0, sk.left)
+			d.maxCd[sk.name] = total
+		end
+		local frac = 1 - math.clamp(sk.left / math.max(total, 0.1), 0, 1)
+		b.fill.Size = UDim2.new(1, 0, frac, 0)
+		b.fill.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+		b.stroke.Color = Color3.fromRGB(255, 80, 80)
+	else
+		b.fill.Size = UDim2.new(1, 0, 1, 0)
+		b.fill.BackgroundColor3 = BAR_FILL
+		b.stroke.Color = BAR_FILL
+	end
+end
+
 local function updateSkillBoxes(d, list)
 	if not d.skills then return end
 	local shown = math.min(#list, 4)
 	for i = 1, shown do
-		local sk = list[i]
-		local b = ensureBox(d, i)
-		b.row.Visible = true
-		b.name.Text = sk.key or tostring(i)
-		if sk.cd and sk.left and sk.left > 0.05 then
-			local total = sk.total
-			if not total then
-				total = math.max(d.maxCd[sk.name] or 0, sk.left)
-				d.maxCd[sk.name] = total
-			end
-			local frac = 1 - math.clamp(sk.left / math.max(total, 0.1), 0, 1)
-			b.fill.Size = UDim2.new(1, 0, frac, 0)
-			b.fill.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
-			b.stroke.Color = Color3.fromRGB(255, 80, 80)
-		else
-			b.fill.Size = UDim2.new(1, 0, 1, 0)
-			b.fill.BackgroundColor3 = BAR_FILL
-			b.stroke.Color = BAR_FILL
-		end
+		paintBox(d, ensureBox(d, i), list[i], list[i].key or tostring(i))
 	end
-	for i = shown + 1, math.min(#d.boxes, 4) do
+	for i = shown + 1, #d.boxes do
 		d.boxes[i].row.Visible = false
-	end
-
-	-- R (Special): свой кулдаун, ищем значение "special" с ReadyAt внутри персонажа
-	local sp = d.specialInst
-	if not (sp and sp.Parent) then
-		sp = nil
-		if os.clock() >= (d.specialNext or 0) then
-			d.specialNext = os.clock() + 2
-			for _, root in ipairs({ d.char, d.player }) do
-				for _, o in ipairs(root:GetDescendants()) do
-					if o.Name:lower():find("special") and o:GetAttribute("ReadyAt") ~= nil then
-						sp = o
-						break
-					end
-				end
-				if sp then break end
-			end
-			d.specialInst = sp
-		end
-	end
-	local rb = ensureBox(d, 5)
-	rb.row.Visible = true
-	rb.name.Text = "R"
-	if not sp then
-		-- кулдаун Special не найден: серый квадрат (статус неизвестен)
-		rb.fill.Size = UDim2.new(1, 0, 0, 0)
-		rb.stroke.Color = Color3.fromRGB(150, 150, 150)
-		return
-	end
-	local ra, lu = sp:GetAttribute("ReadyAt"), sp:GetAttribute("LastUse")
-	local left = type(ra) == "number" and secondsLeft(ra) or 0
-	local total
-	if type(ra) == "number" and type(lu) == "number" and ra > lu then total = ra - lu end
-	if left > 0.05 then
-		total = total or math.max(d.maxCd.__special or 0, left)
-		d.maxCd.__special = total
-		rb.fill.Size = UDim2.new(1, 0, 1 - math.clamp(left / math.max(total, 0.1), 0, 1), 0)
-		rb.fill.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
-		rb.stroke.Color = Color3.fromRGB(255, 80, 80)
-	else
-		rb.fill.Size = UDim2.new(1, 0, 1, 0)
-		rb.fill.BackgroundColor3 = BAR_FILL
-		rb.stroke.Color = BAR_FILL
 	end
 end
 
@@ -684,45 +716,6 @@ task.spawn(function()
 		end
 	end
 end)
-
-local function dumpInfo()
-	for _, p in ipairs(Players:GetPlayers()) do
-		print("=== " .. p.Name)
-		for _, e in ipairs(playerValues(p)) do
-			print(string.format("  %s = %s", e.name, tostring(e.value)))
-		end
-		local bp = p:FindFirstChildOfClass("Backpack")
-		if bp then
-			for _, t in ipairs(bp:GetChildren()) do print("  [backpack] " .. t.Name .. " (" .. t.ClassName .. ")") end
-		end
-		if p.Character then
-			for _, c in ipairs(p.Character:GetChildren()) do
-				print("  [char] " .. c.Name .. " (" .. c.ClassName .. ")")
-			end
-			-- полный дамп Info / Moveset: значения + все атрибуты
-			for _, fname in ipairs({ "Info", "Moveset" }) do
-				local f = p.Character:FindFirstChild(fname)
-				if f then
-					print("  --- " .. fname)
-					for _, v in ipairs(f:GetDescendants()) do
-						local val = v:IsA("ValueBase") and tostring(v.Value) or ""
-						print(string.format("    %s (%s) %s", v:GetFullName():gsub("^.-" .. fname, fname), v.ClassName, val))
-						for k, av in pairs(v:GetAttributes()) do
-							print(string.format("       @%s = %s", k, tostring(av)))
-						end
-					end
-					for k, av in pairs(f:GetAttributes()) do
-						print(string.format("    @%s = %s", k, tostring(av)))
-					end
-				end
-			end
-			for k, av in pairs(p.Character:GetAttributes()) do
-				print(string.format("  [char attr] %s = %s", k, tostring(av)))
-			end
-		end
-	end
-	print("[EjejHuesos Hub] dump done")
-end
 
 -- ============================================================
 -- DOORS (ESP + таймер)
@@ -1782,7 +1775,7 @@ local function addSlider(page, text, min, max, step, initial, order, callback)
 	corner(knob, 7)
 
 	local function show(v)
-		local rel = (v - min) / (max - min)
+		local rel = math.clamp((v - min) / (max - min), 0, 1)
 		fill.Size = UDim2.new(rel, 0, 1, 0)
 		knob.Position = UDim2.new(rel, 0, 0.5, 0)
 		valLbl.Text = string.format("%g", v)
@@ -1950,11 +1943,10 @@ addToggle(pageESP, "🚪", "Door ESP", Config.DoorESP, 2, function(v)
 	Config.DoorESP = v
 	applyDoorESP()
 end)
-addToggle(pageESP, "⚔", "Evasive / Ult", Config.SkillESP, 3, function(v)
+addToggle(pageESP, "⚔", "Cooldown/Ult info ESP", Config.SkillESP, 3, function(v)
 	Config.SkillESP = v
 	applySkillESP()
 end)
-addButton(pageESP, "🔎", "Dump Info (консоль F9)", 4, dumpInfo)
 
 addSection(pageMisc, "MISC", 0)
 addSlider(pageMisc, "Farm Delay (сек)", 0.1, 2, 0.05, Config.FarmDelay, 1, function(v) Config.FarmDelay = v end)
@@ -2056,5 +2048,16 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		flyToggle.Set(not Config.Fly)
 	end
 end)
+
+-- применяем загруженный из файла полёт
+if Config.Fly then
+	task.spawn(function()
+		local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+		char:WaitForChild("HumanoidRootPart")
+		char:WaitForChild("Humanoid")
+		task.wait(0.3)
+		applyFly()
+	end)
+end
 
 print("[EjejHuesos Hub] loaded")
