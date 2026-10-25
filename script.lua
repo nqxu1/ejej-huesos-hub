@@ -1803,20 +1803,18 @@ local function chaseRunner(model)
 	end
 end
 
-task.spawn(function()
-	while true do
-		task.wait(0.1)
+local function farmStep()
 		if not Config.AutoFarm then
 			if farmAnchoredHrp then releaseFarm() end
 			setFarmStatus("выключен")
-			continue
+			return
 		end
 
 		local _, hrp, hum = getChar()
 		if not hrp or not hum or hum.Health <= 0 then
 			farmAnchoredHrp = nil
 			task.wait(0.5)
-			continue
+			return
 		end
 
 		-- бегающая дверь важнее: она убегает, статичные никуда не денутся
@@ -1829,7 +1827,7 @@ task.spawn(function()
 			local runner = pickRunner(hrp)
 			if runner then
 				chaseRunner(runner)
-				continue
+				return
 			end
 		end
 
@@ -1837,7 +1835,7 @@ task.spawn(function()
 		if not model then
 			-- других дверей нет: в укрытие и ждём
 			goToShelter(hrp)
-			continue
+			return
 		end
 
 		setFarmAnchored(hrp, true)
@@ -1860,32 +1858,32 @@ task.spawn(function()
 		local travel = (doorPos - hrp.Position).Magnitude / Config.FarmSpeed + 3
 		if doorSecondsLeft(d) > travel then
 			goToShelter(hrp)
-			continue
+			return
 		end
 		farmIgnoreModel = model
 
 		-- 2) к двери (без ноклипа). Между дверями наверх не поднимаемся
 		prompt = getPrompt(model, d)
-		if not prompt then continue end
+		if not prompt then return end
 		doorPos = promptPosition(prompt, model)
 		local spot = pickDoorSpot(model, doorPos, fromPos)
 		if not spot then
 			giveUp(model, 20)
-			continue
+			return
 		end
 		setFarmStatus("лечу к двери")
 		if not flyRetry(spot, true) then
 			warn("[EjejHuesos Hub] не долетел до двери, пропускаю её на 3 сек")
 			setFarmStatus("не долететь до двери")
 			giveUp(model, 3)
-			continue
+			return
 		end
 		setFarmStatus("жду таймер у двери")
 
 		-- 3) если таймер ещё не кончился — ждём у двери, потом замораживаемся и лутаем
 		if not waitReady(30) then
 			giveUp(model, 10)
-			continue
+			return
 		end
 
 		setFarmStatus("забираю лут")
@@ -1908,6 +1906,19 @@ task.spawn(function()
 			skipDoor[model] = os.clock() + Config.LootedSkip
 			farmLooted += 1
 			setFarmStatus("лут собран")
+		end
+end
+
+-- любая ошибка (например, при смерти персонажа) не должна убивать цикл автофарма насовсем
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		local ok, err = pcall(farmStep)
+		if not ok then
+			warn("[EjejHuesos Hub] ошибка автофарма: " .. tostring(err))
+			pcall(releaseFarm)
+			farmSpeedMul = 1
+			task.wait(0.5)
 		end
 	end
 end)
@@ -2118,6 +2129,13 @@ end
 Players.PlayerAdded:Connect(setupBlockWatch)
 Players.PlayerRemoving:Connect(unwatchAttacker)
 for _, p in ipairs(Players:GetPlayers()) do setupBlockWatch(p) end
+
+LocalPlayer.CharacterAdded:Connect(function()
+	farmAnchoredHrp = nil
+	farmSpeedMul = 1
+	farmIgnoreModel = nil
+	safeSpot, airSpot = nil, nil
+end)
 
 LocalPlayer.CharacterRemoving:Connect(function()
 	if blocking then sendBlockKey(false) end
