@@ -1,6 +1,6 @@
 -- EjejHuesos Hub
 -- LocalScript -> StarterPlayer > StarterPlayerScripts
--- Функции: Auto Farm Doors, Instant E, Fly (настраиваемый бинд), Player ESP (дистанция + HP), Door ESP (таймер)
+-- Функции: Auto Farm Doors, Instant E, Fly (настраиваемый бинд), Auto Block, Player ESP (дистанция + HP), Door ESP (таймер)
 -- RightShift — открыть/скрыть меню, бинд полёта меняется во вкладке Main
 -- Настройки автоматически сохраняются для каждого игрока (файл EjejHuesosHub_<UserId>.json)
 
@@ -45,6 +45,18 @@ local Config = {
 	UseGameSafeZone = true, -- если в карте есть деталь с именем SafeZone — прячемся там
 	FreezeTime = 1,      -- сколько секунд стоим заморожены у двери перед лутом
 	PromptRange = 60,
+
+	-- AUTO BLOCK
+	AutoBlock = false,
+	FaceAttacker = true,   -- всегда включён вместе с Auto Block: бьют в спину -> на время блока разворачиваемся к атакующему
+	BlockKey = Enum.KeyCode.F,
+	BlockDistance = 18,    -- на каком расстоянии (стадов) реагируем на удар
+	BlockHold = 0.3,       -- сколько секунд держим блок (подобрано, в меню не выводится)
+	BlockDelay = 0,        -- задержка перед блоком после начала чужого удара (подгони под тайминг)
+	AttackFacingDot = 0,   -- реагируем, только если атакующий повёрнут к нам (1 = строго на нас, -1 = всегда)
+	BlockAttributes = { "LastM1", "LastM2" }, -- атрибуты персонажа, которые меняются при ударе
+	AnimDetectV2 = true,   -- самообучение: анимация, которая совпала с кликом M1/M2, дальше вызывает блок мгновенно
+	BlockDebug = false,    -- true = писать в консоль F9, какая анимация / атрибут вызвали блок
 	DoorName = "HalloweenDoor",
 }
 
@@ -59,11 +71,12 @@ local SAVE_FILE = "EjejHuesosHub_" .. LocalPlayer.UserId .. ".json"
 local SAVE_KEYS = {
 	"PlayerESP", "SkillESP", "DoorESP", "InstantE", "AutoFarm", "Fly",
 	"FlySpeed", "FarmDelay", "FarmSpeed", "WaitRadius", "CollectTime",
+	"AutoBlock", "BlockDistance",
 }
 local canFile = (writefile ~= nil and readfile ~= nil and isfile ~= nil)
 
 local function serializeConfig()
-	local data = { FlyKey = Config.FlyKey.Name }
+	local data = { FlyKey = Config.FlyKey.Name, BlockKey = Config.BlockKey.Name }
 	for _, k in ipairs(SAVE_KEYS) do data[k] = Config[k] end
 	return HttpService:JSONEncode(data)
 end
@@ -80,6 +93,10 @@ local function loadSettings()
 	if type(data.FlyKey) == "string" then
 		local okKey, key = pcall(function() return Enum.KeyCode[data.FlyKey] end)
 		if okKey and key then Config.FlyKey = key end
+	end
+	if type(data.BlockKey) == "string" then
+		local okKey, key = pcall(function() return Enum.KeyCode[data.BlockKey] end)
+		if okKey and key then Config.BlockKey = Enum.KeyCode.F end -- клавиша блока зафиксирована
 	end
 end
 
@@ -1736,6 +1753,219 @@ task.spawn(function()
 end)
 
 -- ============================================================
+-- AUTO BLOCK
+-- Чужой удар = изменение атрибута LastM1 / LastM2 на его персонаже (Explorer -> Characters -> модель).
+-- В момент удара на долю секунды зажимаем кнопку блока. Если бьют в спину — на время блока
+-- разворачиваем персонажа лицом к атакующему, а после блока возвращаем прежний поворот.
+-- ============================================================
+local okVIM, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
+local blocking = false
+local blockUntil = 0
+local aimTarget -- HumanoidRootPart атакующего, на которого сейчас развёрнуты
+local savedRot, savedAutoRotate -- поворот и AutoRotate до разворота
+
+local function sendBlockKey(down)
+	local key = Config.BlockKey
+	local sent = false
+	if okVIM and VIM then
+		sent = pcall(function() VIM:SendKeyEvent(down, key, false, game) end)
+	end
+	if not sent then
+		-- запасной вариант: keypress / keyrelease (только для клавиш-букв и цифр)
+		local fn = down and keypress or keyrelease
+		if fn and #key.Name == 1 then pcall(fn, string.byte(key.Name:upper())) end
+	end
+end
+
+-- отпускаем блок и возвращаем персонажа в прежнее положение
+local function stopBlock()
+	if blocking then
+		blocking = false
+		sendBlockKey(false)
+	end
+	local _, hrp, hum = getChar()
+	if savedRot and hrp and hrp.Parent then
+		hrp.CFrame = CFrame.new(hrp.Position) * savedRot
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+	if hum and savedAutoRotate ~= nil then hum.AutoRotate = savedAutoRotate end
+	savedRot, savedAutoRotate, aimTarget = nil, nil, nil
+end
+
+local function startBlock(attackerHrp)
+	if not Config.AutoBlock then return end
+	if UserInputService:GetFocusedTextBox() then return end -- пишем в чат
+	local char, hrp, hum = getChar()
+	if not char or not hrp or not hum or hum.Health <= 0 then return end
+
+	-- в рагдолле блокировать нечем
+	local rag = char:GetAttribute("Ragdoll")
+	if rag == true or (type(rag) == "number" and rag ~= 0) then return end
+
+	-- бьют в спину / сбоку: разворачиваемся к атакующему
+	if Config.FaceAttacker and attackerHrp and attackerHrp.Parent then
+		local to = attackerHrp.Position - hrp.Position
+		local flat = Vector3.new(to.X, 0, to.Z)
+		local look = hrp.CFrame.LookVector
+		local front = Vector3.new(look.X, 0, look.Z)
+		if flat.Magnitude > 0.5 and front.Magnitude > 0.01 and front.Unit:Dot(flat.Unit) < 0.5 then
+			if not savedRot then
+				savedRot = hrp.CFrame.Rotation
+				savedAutoRotate = hum.AutoRotate
+			end
+			hum.AutoRotate = false
+			aimTarget = attackerHrp
+			hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
+			hrp.AssemblyAngularVelocity = Vector3.zero
+			task.wait() -- кадр на поворот, и только потом блок
+		end
+	end
+
+	blockUntil = math.max(blockUntil, os.clock() + Config.BlockHold)
+	if not blocking then
+		blocking = true
+		sendBlockKey(true)
+	end
+end
+
+-- пока блок держится: следим за атакующим и отпускаем по таймеру
+RunService.Heartbeat:Connect(function()
+	if not blocking and not savedRot then return end
+	local _, hrp, hum = getChar()
+	if not hrp or not hum or hum.Health <= 0 then
+		if blocking then sendBlockKey(false) end
+		blocking = false
+		savedRot, savedAutoRotate, aimTarget = nil, nil, nil
+		return
+	end
+	if aimTarget and aimTarget.Parent then
+		local a = aimTarget.Position
+		local flat = Vector3.new(a.X - hrp.Position.X, 0, a.Z - hrp.Position.Z)
+		if flat.Magnitude > 0.5 then
+			hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
+		end
+	end
+	if os.clock() >= blockUntil or not Config.AutoBlock then
+		stopBlock()
+	end
+end)
+
+-- анимации, которые точно не являются ударом (блок / уклон / стан / эмоции ...)
+local NON_ATTACK = { "block", "guard", "parry", "dodge", "evasive", "evade", "dash", "stun", "ragdoll",
+	"emote", "dance", "idle", "walk", "run", "sprint", "jump", "fall", "land", "hurt", "knock", "getup", "equip" }
+local function isNonAttackAnim(name)
+	name = tostring(name):lower()
+	for _, w in ipairs(NON_ATTACK) do
+		if name:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+-- противник сам держит блок: он не бьёт (и его «блок» не должен запускать наш)
+local function isBlockingNow(char)
+	for name, v in pairs(char:GetAttributes()) do
+		if tostring(name):lower():find("block", 1, true) and (v == true or (type(v) == "number" and v ~= 0)) then
+			return true
+		end
+	end
+	return false
+end
+
+local function onAttack(char, reason)
+	if not Config.AutoBlock then return end
+	local _, hrp, hum = getChar()
+	if not hrp or not hum or hum.Health <= 0 then return end
+	local ahrp = char:FindFirstChild("HumanoidRootPart")
+	if not ahrp then return end
+	if isBlockingNow(char) then return end
+	local d = hrp.Position - ahrp.Position -- от атакующего к нам
+	if d.Magnitude > Config.BlockDistance or d.Magnitude < 0.01 then return end
+	-- бьёт ли он в нашу сторону (иначе удар мимо, блок не нужен)
+	if ahrp.CFrame.LookVector:Dot(d.Unit) < Config.AttackFacingDot then return end
+	if Config.BlockDebug then warn("[EjejHuesos Hub] удар от " .. char.Name .. ": " .. tostring(reason)) end
+	if Config.BlockDelay > 0 then
+		task.delay(Config.BlockDelay, startBlock, ahrp)
+	else
+		task.spawn(startBlock, ahrp)
+	end
+end
+
+local blockWatch = {} -- [player] = { соединения }
+local attackAnims = {}  -- [AnimationId] = true: анимации, которые реально были ударом (выучены по кликам M1/M2)
+
+local function unwatchAttacker(player)
+	local conns = blockWatch[player]
+	if conns then
+		for _, c in ipairs(conns) do c:Disconnect() end
+		blockWatch[player] = nil
+	end
+end
+
+local function watchAttacker(player, char)
+	unwatchAttacker(player)
+	local conns, t0 = {}, os.clock()
+	local lastAction = nil -- { id, t } последняя «боевая» анимация этого игрока
+	blockWatch[player] = conns
+	for _, attr in ipairs(Config.BlockAttributes) do
+		local last = char:GetAttribute(attr)
+		conns[#conns + 1] = char:GetAttributeChangedSignal(attr):Connect(function()
+			local v = char:GetAttribute(attr)
+			-- первую секунду после спавна игнорируем: там атрибуты просто выставляются
+			if os.clock() - t0 < 1 or v == nil or v == last then
+				last = v
+				return
+			end
+			last = v
+			-- клик: запоминаем анимацию, которая только что началась, как анимацию удара
+			if lastAction and os.clock() - lastAction.t < 0.6 and not attackAnims[lastAction.id] then
+				attackAnims[lastAction.id] = true
+				if Config.BlockDebug then warn("[EjejHuesos Hub] выучена анимация удара: " .. lastAction.id) end
+			end
+			onAttack(char, "атрибут " .. attr)
+		end)
+	end
+
+	-- детект по анимации: AnimationPlayed срабатывает в начале замаха, раньше чем игра обновит LastM1
+	task.spawn(function()
+		local hum = char:WaitForChild("Humanoid", 5)
+		local animator = hum and (hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5))
+		if not animator or blockWatch[player] ~= conns then return end
+		local ACTION = {
+			[Enum.AnimationPriority.Action] = true,
+			[Enum.AnimationPriority.Action2] = true,
+			[Enum.AnimationPriority.Action3] = true,
+			[Enum.AnimationPriority.Action4] = true,
+		}
+		conns[#conns + 1] = animator.AnimationPlayed:Connect(function(track)
+			if os.clock() - t0 < 1 then return end
+			if not ACTION[track.Priority] then return end -- ходьба / idle / падение не считаем
+			if isNonAttackAnim(track.Name) then return end -- блок, уклон, эмоции и т.п. — не удар
+			local id = tostring(track.Animation and track.Animation.AnimationId or track.Name)
+			lastAction = { id = id, t = os.clock() }
+			-- реагируем мгновенно только на анимации, которые уже были ударом (клик M1/M2)
+			if not (Config.AnimDetectV2 and attackAnims[id]) then return end
+			onAttack(char, string.format("анимация %s (%s, приоритет %s)", track.Name, tostring(track.Animation and track.Animation.AnimationId), track.Priority.Name))
+		end)
+	end)
+end
+
+local function setupBlockWatch(player)
+	if player == LocalPlayer then return end
+	if player.Character then watchAttacker(player, player.Character) end
+	player.CharacterAdded:Connect(function(char) watchAttacker(player, char) end)
+end
+
+Players.PlayerAdded:Connect(setupBlockWatch)
+Players.PlayerRemoving:Connect(unwatchAttacker)
+for _, p in ipairs(Players:GetPlayers()) do setupBlockWatch(p) end
+
+LocalPlayer.CharacterRemoving:Connect(function()
+	if blocking then sendBlockKey(false) end
+	blocking = false
+	savedRot, savedAutoRotate, aimTarget = nil, nil, nil
+end)
+
+-- ============================================================
 -- FLY
 -- ============================================================
 local flyObjs
@@ -2471,6 +2701,12 @@ addKeybind(pageMain, "⌨", "Fly Key", Config.FlyKey, 5, function(k)
 	updateHint()
 end)
 addSlider(pageMain, "Fly Speed", 10, 150, 5, Config.FlySpeed, 6, function(v) Config.FlySpeed = v end)
+addSection(pageMain, "COMBAT", 7)
+addToggle(pageMain, "🛡", "Auto Block", Config.AutoBlock, 8, function(v)
+	Config.AutoBlock = v
+	if not v then stopBlock() end
+end)
+addSlider(pageMain, "Block Trigger Distance (studs)", 5, 60, 1, Config.BlockDistance, 10, function(v) Config.BlockDistance = v end)
 
 addSection(pageESP, "ESP", 0)
 addToggle(pageESP, "👤", "Player ESP", Config.PlayerESP, 1, function(v)
