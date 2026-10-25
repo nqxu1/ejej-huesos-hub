@@ -58,6 +58,8 @@ local Config = {
 	AnimDetectV2 = true,   -- самообучение: анимация, которая совпала с кликом M1/M2, дальше вызывает блок мгновенно
 	BlockDebug = false,    -- true = писать в консоль F9, какая анимация / атрибут вызвали блок
 	DoorName = "HalloweenDoor",
+	ChaseDoors = true,     -- догонять и бить бегающую дверь (модель "Door" с Humanoid)
+	ChaseTimeout = 30,     -- сколько секунд максимум гонимся за одной дверью
 }
 
 if #Config.AllowedUserIds > 0 and not table.find(Config.AllowedUserIds, LocalPlayer.UserId) then
@@ -71,7 +73,7 @@ local SAVE_FILE = "EjejHuesosHub_" .. LocalPlayer.UserId .. ".json"
 local SAVE_KEYS = {
 	"PlayerESP", "SkillESP", "DoorESP", "InstantE", "AutoFarm", "Fly",
 	"FlySpeed", "FarmDelay", "FarmSpeed", "WaitRadius", "CollectTime",
-	"AutoBlock", "BlockDistance",
+	"ChaseDoors", "AutoBlock", "BlockDistance",
 }
 local canFile = (writefile ~= nil and readfile ~= nil and isfile ~= nil)
 
@@ -1657,6 +1659,129 @@ local function goToShelter(hrp)
 	end
 end
 
+-- ============================================================
+-- БЕГАЮЩАЯ ДВЕРЬ: модель "Door" с Humanoid (R6-риг, рядом с персонажами игроков).
+-- Её нужно догнать и ударить (M1). Ищем один раз и дальше следим за появлением/исчезновением.
+-- ============================================================
+local runnerDoors = {}
+local skipRunner = setmetatable({}, { __mode = "k" })
+local okVIM2, VIM2 = pcall(function() return game:GetService("VirtualInputManager") end)
+
+local function registerRunner(m)
+	if runnerDoors[m] or not m:IsA("Model") or m.Name ~= "Door" then return end
+	if Players:GetPlayerFromCharacter(m) then return end
+	task.spawn(function()
+		local hum = m:WaitForChild("Humanoid", 3)
+		local root = m:WaitForChild("HumanoidRootPart", 3)
+		if hum and root and m.Parent then runnerDoors[m] = true end
+	end)
+end
+
+task.spawn(function()
+	local n = 0
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst.Name == "Door" then registerRunner(inst) end
+		n += 1
+		if n % 3000 == 0 then task.wait() end
+	end
+end)
+Workspace.DescendantAdded:Connect(function(inst)
+	if inst.Name == "Door" then registerRunner(inst) end
+end)
+Workspace.DescendantRemoving:Connect(function(inst)
+	if runnerDoors[inst] then runnerDoors[inst] = nil end
+end)
+
+local function runnerAlive(m)
+	if not m.Parent then return false end
+	local root = m:FindFirstChild("HumanoidRootPart")
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	return root ~= nil and root.Parent ~= nil and (hum == nil or hum.Health > 0)
+end
+
+local function pickRunner(hrp)
+	local best, bestD = nil, math.huge
+	for m in pairs(runnerDoors) do
+		if runnerAlive(m) and (skipRunner[m] or 0) < os.clock() then
+			local dist = (m.HumanoidRootPart.Position - hrp.Position).Magnitude
+			if dist < bestD then best, bestD = m, dist end
+		end
+	end
+	return best
+end
+
+local function clickM1()
+	if not (okVIM2 and VIM2) then return end
+	local cam = Workspace.CurrentCamera
+	local c = cam and cam.ViewportSize / 2 or Vector2.new(400, 300)
+	pcall(function()
+		VIM2:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 1)
+		VIM2:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 1)
+	end)
+end
+
+-- догоняем и бьём, пока дверь не исчезнет / не умрёт / не истечёт таймаут
+local function chaseRunner(model)
+	local rhrp = model:FindFirstChild("HumanoidRootPart")
+	if not rhrp then return end
+	local t0, lastClick, fails, lastT = os.clock(), 0, 0, os.clock()
+	farmIgnoreModel = model
+	setFarmStatus("гонюсь за бегущей дверью")
+	while Config.AutoFarm and Config.ChaseDoors and runnerAlive(model) and os.clock() - t0 < Config.ChaseTimeout do
+		local _, hrp, hum = getChar()
+		if not hrp or not hum or hum.Health <= 0 then return end
+		setFarmAnchored(hrp, true)
+		local target = rhrp.Position
+		local dist = (target - hrp.Position).Magnitude
+		local now = os.clock()
+		local dt = math.clamp(now - lastT, 0.01, 0.2)
+		lastT = now
+
+		local near = false
+		if dist > 14 then
+			-- далеко: обычный полёт с обходом препятствий (цель подвижна, поэтому после прилёта пересчитаем)
+			local back = (hrp.Position - target)
+			back = back.Magnitude > 0.1 and back.Unit or Vector3.new(0, 0, 1)
+			if flyTo(target + back * 4, false) then fails = 0 else
+				fails += 1
+				if fails >= 3 then
+					skipRunner[model] = os.clock() + 8
+					setFarmStatus("не догнать дверь")
+					return
+				end
+				task.wait(0.2)
+			end
+		else
+			-- рядом: держимся в ~3 стадах и смотрим на дверь
+			local toMe = hrp.Position - target
+			toMe = Vector3.new(toMe.X, 0, toMe.Z)
+			toMe = toMe.Magnitude > 0.1 and toMe.Unit or Vector3.new(0, 0, 1)
+			local want = Vector3.new(target.X, target.Y, target.Z) + toMe * 3
+			local step = math.min((want - hrp.Position).Magnitude, Config.FarmSpeed * dt)
+			local dirv = want - hrp.Position
+			local newPos = dirv.Magnitude > 0.05 and hrp.Position + dirv.Unit * step or hrp.Position
+			if segmentClear(hrp.Position, newPos, makeRayParams(model)) then
+				hrp.CFrame = CFrame.lookAt(newPos, Vector3.new(target.X, newPos.Y, target.Z))
+				near = (target - newPos).Magnitude <= 6
+			elseif not flyTo(want, false) then
+				fails += 1
+				if fails >= 3 then skipRunner[model] = os.clock() + 8 return end
+			end
+			task.wait(0.03)
+		end
+		if near and now - lastClick > 0.22 then
+			lastClick = now
+			clickM1()
+		end
+	end
+	if not runnerAlive(model) then
+		farmLooted += 1
+		setFarmStatus("дверь побита")
+	else
+		skipRunner[model] = os.clock() + 8
+	end
+end
+
 task.spawn(function()
 	while true do
 		task.wait(0.1)
@@ -1671,6 +1796,15 @@ task.spawn(function()
 			farmAnchoredHrp = nil
 			task.wait(0.5)
 			continue
+		end
+
+		-- бегающая дверь важнее: она убегает, статичные никуда не денутся
+		if Config.ChaseDoors then
+			local runner = pickRunner(hrp)
+			if runner then
+				chaseRunner(runner)
+				continue
+			end
 		end
 
 		local model, d, prompt = pickDoor(hrp)
@@ -2690,6 +2824,7 @@ addToggle(pageMain, "🚪", "Auto Farm Doors", Config.AutoFarm, 1, function(v)
 	Config.AutoFarm = v
 	if not v then releaseFarm() end
 end)
+addToggle(pageMain, "🏃", "Chase Running Door", Config.ChaseDoors, 1.5, function(v) Config.ChaseDoors = v end)
 addToggle(pageMain, "⚡", "Instant E", Config.InstantE, 2, function(v) Config.InstantE = v end)
 addSection(pageMain, "MOVEMENT", 3)
 local flyToggle = addToggle(pageMain, "🕊", "Fly", Config.Fly, 4, function(v)
