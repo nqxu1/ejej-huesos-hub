@@ -823,7 +823,7 @@ local function setupDoor(model)
 	label.TextStrokeTransparency = 0.3
 	label.Parent = bb
 
-	doors[model] = { hl = hl, bb = bb, label = label, nextSearch = 0 }
+	doors[model] = { hl = hl, bb = bb, label = label, nextSearch = 0, born = os.clock() }
 	model.AncestryChanged:Connect(function(_, parent)
 		if not parent then removeDoor(model) end
 	end)
@@ -969,11 +969,23 @@ local function firePrompt(prompt)
 end
 
 local function doorSecondsLeft(d)
+	local now = os.clock()
 	local lbl = d.timer
 	if lbl and lbl.Parent then
 		local m, sec = lbl.Text:match("^%s*(%d+):(%d%d)%s*$")
-		if m then return (tonumber(m) or 0) * 60 + (tonumber(sec) or 0) end
+		if m then
+			local v = (tonumber(m) or 0) * 60 + (tonumber(sec) or 0)
+			d.lastSecs, d.lastT = v, now
+			return v
+		end
 	end
+	-- метка на миг пропала / сменила текст: не считаем дверь «готовой», а продолжаем отсчёт
+	-- от последнего известного значения (раньше из-за этого скрипт иногда летел к двери с таймером 1:18)
+	if d.lastSecs and now - d.lastT < 600 then
+		return math.max(0, d.lastSecs - (now - d.lastT))
+	end
+	-- дверь только появилась и таймер ещё не нашли
+	if now - (d.born or 0) < 4 then return 60 end
 	return 0
 end
 
@@ -1692,6 +1704,15 @@ Workspace.DescendantRemoving:Connect(function(inst)
 	if runnerDoors[inst] then runnerDoors[inst] = nil end
 end)
 
+-- «настоящая» бегающая дверь: видимая, не декорация/заготовка
+local function runnerVisible(m)
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("BasePart") and d.Transparency < 0.95 then return true end
+		if d:IsA("Decal") or d:IsA("Texture") or d:IsA("SurfaceAppearance") then return true end
+	end
+	return false
+end
+
 local function runnerAlive(m)
 	if not m.Parent then return false end
 	local root = m:FindFirstChild("HumanoidRootPart")
@@ -1702,7 +1723,7 @@ end
 local function pickRunner(hrp)
 	local best, bestD = nil, math.huge
 	for m in pairs(runnerDoors) do
-		if runnerAlive(m) and (skipRunner[m] or 0) < os.clock() then
+		if runnerAlive(m) and runnerVisible(m) and (skipRunner[m] or 0) < os.clock() then
 			local dist = (m.HumanoidRootPart.Position - hrp.Position).Magnitude
 			if dist < bestD then best, bestD = m, dist end
 		end
@@ -1752,17 +1773,17 @@ local function chaseRunner(model)
 				task.wait(0.2)
 			end
 		else
-			-- рядом: держимся в ~3 стадах и смотрим на дверь
+			-- рядом: прижимаемся вплотную (~1.8 стада) и смотрим на дверь
 			local toMe = hrp.Position - target
 			toMe = Vector3.new(toMe.X, 0, toMe.Z)
 			toMe = toMe.Magnitude > 0.1 and toMe.Unit or Vector3.new(0, 0, 1)
-			local want = Vector3.new(target.X, target.Y, target.Z) + toMe * 3
+			local want = Vector3.new(target.X, target.Y, target.Z) + toMe * 1.8 -- вплотную к двери
 			local step = math.min((want - hrp.Position).Magnitude, Config.FarmSpeed * dt)
 			local dirv = want - hrp.Position
 			local newPos = dirv.Magnitude > 0.05 and hrp.Position + dirv.Unit * step or hrp.Position
 			if segmentClear(hrp.Position, newPos, makeRayParams(model)) then
 				hrp.CFrame = CFrame.lookAt(newPos, Vector3.new(target.X, newPos.Y, target.Z))
-				near = (target - newPos).Magnitude <= 6
+				near = (target - newPos).Magnitude <= 4.5
 			elseif not flyTo(want, false) then
 				fails += 1
 				if fails >= 3 then skipRunner[model] = os.clock() + 8 return end
@@ -1799,7 +1820,12 @@ task.spawn(function()
 		end
 
 		-- бегающая дверь важнее: она убегает, статичные никуда не денутся
-		if Config.ChaseDoors then
+		-- только во время ивента: пока нет дверей / таймера, никуда не летим
+		local eventOn = false
+		for dm, dd in pairs(doors) do
+			if dm.Parent and getPrompt(dm, dd) then eventOn = true break end
+		end
+		if Config.ChaseDoors and eventOn then
 			local runner = pickRunner(hrp)
 			if runner then
 				chaseRunner(runner)
@@ -2919,18 +2945,41 @@ local ball = Instance.new("TextButton")
 ball.Name = "Ball"
 ball.Size = UDim2.new(0, 48, 0, 48)
 ball.Position = UDim2.new(0, 30, 0.5, 0)
-ball.BackgroundColor3 = Theme.AccentDark
-ball.Text = "E"
-ball.TextColor3 = Color3.new(1, 1, 1)
-ball.TextSize = 26
-ball.Font = Enum.Font.GothamBold
+ball.BackgroundTransparency = 1
+ball.Text = ""
 ball.AutoButtonColor = false
 ball.Visible = false
 ball.Parent = gui
-corner(ball, 24)
-stroke(ball, Theme.Lavender, 2, 0.2)
-ball.MouseEnter:Connect(function() tween(ball, { BackgroundColor3 = Theme.Accent }, 0.14) end)
-ball.MouseLeave:Connect(function() tween(ball, { BackgroundColor3 = Theme.AccentDark }, 0.14) end)
+
+-- вид как у логотипа в шапке меню: скруглённый квадрат с градиентом, обводкой и буквой E
+local ballFace = Instance.new("Frame")
+ballFace.Size = UDim2.new(1, 0, 1, 0)
+ballFace.BackgroundColor3 = Theme.AccentDark
+ballFace.BorderSizePixel = 0
+ballFace.Active = false
+ballFace.Parent = ball
+corner(ballFace, 14)
+local ballStroke = stroke(ballFace, Theme.Accent, 1, 0.32)
+local ballGrad = Instance.new("UIGradient")
+ballGrad.Color = ColorSequence.new(Theme.Accent, Theme.AccentDark)
+ballGrad.Rotation = 45
+ballGrad.Parent = ballFace
+local ballLetter = Instance.new("TextLabel")
+ballLetter.Size = UDim2.new(1, 0, 1, 0)
+ballLetter.BackgroundTransparency = 1
+ballLetter.Text = "E"
+ballLetter.TextSize = 24
+ballLetter.TextColor3 = Theme.Text
+ballLetter.Font = Enum.Font.GothamBlack
+ballLetter.Parent = ballFace
+ball.MouseEnter:Connect(function()
+	tween(ballFace, { Size = UDim2.new(1, 4, 1, 4), Position = UDim2.new(0, -2, 0, -2) }, 0.14)
+	if ballStroke then tween(ballStroke, { Transparency = 0 }, 0.14) end
+end)
+ball.MouseLeave:Connect(function()
+	tween(ballFace, { Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 0, 0) }, 0.14)
+	if ballStroke then tween(ballStroke, { Transparency = 0.32 }, 0.14) end
+end)
 
 local ballMoved = false
 makeDraggable(ball, ball, function() ballMoved = true end)
