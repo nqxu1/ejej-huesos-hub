@@ -38,6 +38,10 @@ local Config = {
 	WaitRadius = 75,     -- на каком расстоянии от двери ждём таймер (50-100)
 	FarmClearance = 20,  -- запас высоты над постройками
 	WaitHeight = 5,      -- высота ожидания над уровнем двери (ниже = меньше)
+	LiftHeight = 12,     -- на сколько стадов поднимаемся вертикально с земли / крыши (чтобы перелететь бортики)
+	CollectTime = 2,     -- сколько секунд стоим у двери после лута, чтобы забрать конфеты
+	LootedSkip = 8,      -- сколько секунд не возвращаемся к только что залутанной двери
+	SafeZone = nil,      -- своя безопасная точка, например Vector3.new(0, 300, 0); nil = скрипт сам выбирает высокое место подальше от игроков
 	FreezeTime = 1,      -- сколько секунд стоим заморожены у двери перед лутом
 	PromptRange = 60,
 	DoorName = "HalloweenDoor",
@@ -53,7 +57,7 @@ end
 local SAVE_FILE = "EjejHuesosHub_" .. LocalPlayer.UserId .. ".json"
 local SAVE_KEYS = {
 	"PlayerESP", "SkillESP", "DoorESP", "InstantE", "AutoFarm", "Fly",
-	"FlySpeed", "FarmDelay", "FarmSpeed", "WaitRadius",
+	"FlySpeed", "FarmDelay", "FarmSpeed", "WaitRadius", "CollectTime",
 }
 local canFile = (writefile ~= nil and readfile ~= nil and isfile ~= nil)
 
@@ -94,15 +98,17 @@ task.spawn(function()
 end)
 
 local Theme = {
-	Bg = Color3.fromRGB(10, 8, 18),
-	Panel = Color3.fromRGB(16, 12, 28),
-	Item = Color3.fromRGB(22, 17, 38),
-	Stroke = Color3.fromRGB(60, 35, 110),
-	Accent = Color3.fromRGB(150, 70, 255),
-	AccentDark = Color3.fromRGB(95, 35, 190),
-	Text = Color3.fromRGB(240, 238, 250),
-	SubText = Color3.fromRGB(150, 140, 175),
-	Off = Color3.fromRGB(45, 40, 62),
+	Bg = Color3.fromRGB(8, 6, 18),
+	Panel = Color3.fromRGB(17, 12, 32),
+	Item = Color3.fromRGB(27, 18, 48),
+	Stroke = Color3.fromRGB(43, 28, 70),
+	Accent = Color3.fromRGB(151, 71, 255),
+	AccentDark = Color3.fromRGB(69, 30, 125),
+	Lavender = Color3.fromRGB(199, 143, 255),
+	VioletSoft = Color3.fromRGB(118, 74, 180),
+	Text = Color3.fromRGB(248, 248, 250),
+	SubText = Color3.fromRGB(156, 156, 168),
+	Off = Color3.fromRGB(43, 28, 70),
 	PlayerColor = Color3.fromRGB(0, 255, 100),
 	DoorColor = Color3.fromRGB(255, 140, 0),
 }
@@ -176,7 +182,7 @@ local function createPlayerESP(player, char)
 
 	local label = Instance.new("TextLabel")
 	label.Size = UDim2.new(1, 0, 0, 22)
-	label.Position = UDim2.new(0, 0, 0, 18)
+	label.Position = UDim2.new(0, 0, 0, 12)
 	label.BackgroundTransparency = 1
 	label.Font = Enum.Font.GothamBold
 	label.TextSize = 13
@@ -197,7 +203,7 @@ local function createPlayerESP(player, char)
 	info.TextColor3 = Color3.new(1, 1, 1)
 	info.TextStrokeTransparency = 0.3
 	info.Text = ""
-	info.Visible = Config.SkillESP
+	info.Visible = false -- надпись Evasive / Ult убрана
 	info.Parent = bb
 
 	-- скиллы под персонажем (отдельный billboard под ногами)
@@ -695,7 +701,6 @@ end
 
 local function applySkillESP()
 	for _, d in pairs(playerESP) do
-		if d.info then d.info.Visible = Config.SkillESP end
 		if d.bb2 then d.bb2.Enabled = Config.SkillESP end
 		if d.bb3 then d.bb3.Enabled = Config.SkillESP end
 	end
@@ -706,8 +711,6 @@ task.spawn(function()
 		if Config.SkillESP then
 			for player, d in pairs(playerESP) do
 				if d.info then
-					local ok, text = pcall(buildInfo, player)
-					d.info.Text = ok and text or ""
 					local ok2, list = pcall(function() return movesetList(d.char) or skillList(player) end)
 					updateSkillBoxes(d, ok2 and list or {})
 					pcall(updateSideBars, d, player)
@@ -908,6 +911,17 @@ local PathfindingService = game:GetService("PathfindingService")
 local fpp = fireproximityprompt
 local farmAnchoredHrp
 local skipDoor = setmetatable({}, { __mode = "k" })
+local farmStatusText, farmLooted = "выключен", 0
+local farmStatusLabel -- создаётся в меню
+local function setFarmStatus(t)
+	if t == nil then t = farmStatusText end
+	if t == farmStatusText and farmStatusLabel and farmStatusLabel.Text ~= "" then return end
+	farmStatusText = t
+	if farmStatusLabel then
+		farmStatusLabel.Text = string.format("Статус: %s\nДверей залутано: %d", farmStatusText, farmLooted)
+	end
+end
+local lastSafe -- безопасная точка (возвышенность у последней залутанной двери)
 
 local function setFarmAnchored(hrp, state)
 	hrp.Anchored = state
@@ -938,7 +952,7 @@ local function doorSecondsLeft(d)
 	local lbl = d.timer
 	if lbl and lbl.Parent then
 		local m, sec = lbl.Text:match("^%s*(%d+):(%d%d)%s*$")
-		if m then return tonumber(m) * 60 + tonumber(sec) end
+		if m then return (tonumber(m) or 0) * 60 + (tonumber(sec) or 0) end
 	end
 	return 0
 end
@@ -1018,12 +1032,56 @@ local function cruiseY(a, b, params)
 end
 
 -- ---------- движение ----------
+-- ---------- запоминаем места, где сервер откатывает ----------
+-- Если полёт сорвался (откат / упёрлись), точка отмечается как препятствие: планировщик
+-- маршрута обходит её, а прямой путь через неё не используется. Метки живут 15 минут.
+local learnedBlocks = {}
+local LEARN_TTL = 900
+
+local function learnBlock(p)
+	local now = os.clock()
+	for i = #learnedBlocks, 1, -1 do
+		local b = learnedBlocks[i]
+		if now - b.t > LEARN_TTL then
+			table.remove(learnedBlocks, i)
+		elseif (b.p - p).Magnitude < 3 then
+			b.t = now
+			return
+		end
+	end
+	learnedBlocks[#learnedBlocks + 1] = { p = p, t = now }
+	if #learnedBlocks > 80 then table.remove(learnedBlocks, 1) end
+end
+
+local function nearLearned(p, r)
+	local now = os.clock()
+	for _, b in ipairs(learnedBlocks) do
+		if now - b.t <= LEARN_TTL then
+			local d = b.p - p
+			if Vector3.new(d.X, 0, d.Z).Magnitude < r and math.abs(d.Y) < 9 then return true end
+		end
+	end
+	return false
+end
+
+local function pathHitsLearned(a, b)
+	local d = b - a
+	local n = math.max(1, math.ceil(d.Magnitude / 3))
+	for i = 0, n do
+		if nearLearned(a + d * (i / n), 6) then return true end
+	end
+	return false
+end
+
+local farmSpeedMul = 1 -- падает после отката сервером, чтобы не ловить телепорт назад
+
 local function tweenTo(hrp, pos)
 	local dist = (pos - hrp.Position).Magnitude
 	if dist < 0.5 then return true end
+	local speed = Config.FarmSpeed * farmSpeedMul
 	local tw = TweenService:Create(
 		hrp,
-		TweenInfo.new(dist / Config.FarmSpeed, Enum.EasingStyle.Linear),
+		TweenInfo.new(dist / speed, Enum.EasingStyle.Linear),
 		{ CFrame = CFrame.new(pos) * hrp.CFrame.Rotation }
 	)
 	local done = false
@@ -1031,7 +1089,9 @@ local function tweenTo(hrp, pos)
 	tw:Play()
 
 	local last = hrp.Position
-	local deadline = os.clock() + dist / Config.FarmSpeed + 5
+	local deadline = os.clock() + dist / speed + 2
+	local checkAt = os.clock() + 0.5
+	local checkDist = dist
 	while not done do
 		local dt = task.wait()
 		if not Config.AutoFarm or not hrp:IsDescendantOf(Workspace) then
@@ -1040,11 +1100,28 @@ local function tweenTo(hrp, pos)
 		end
 		-- сервер откатил (телепорт назад) или мы застряли -> прерываем, чтобы не зависнуть
 		local cur = hrp.Position
-		if (cur - last).Magnitude > Config.FarmSpeed * dt * 2 + 8 or os.clock() > deadline then
+		if (cur - last).Magnitude > speed * dt * 2 + 8 or os.clock() > deadline then
+			warn(string.format("[EjejHuesos Hub] полёт прерван (откат сервером / таймаут) около %d, %d, %d",
+				last.X, last.Y, last.Z))
+			local toward = pos - last
+			learnBlock(last + (toward.Magnitude > 0.1 and toward.Unit * 4 or Vector3.zero))
 			tw:Cancel()
 			return false
 		end
 		last = cur
+		-- застряли у стены: за 0.5 сек почти не приблизились к цели
+		if os.clock() >= checkAt then
+			local nowDist = (pos - cur).Magnitude
+			if checkDist - nowDist < speed * 0.5 * 0.3 then
+				warn(string.format("[EjejHuesos Hub] упёрлись в препятствие около %d, %d, %d", cur.X, cur.Y, cur.Z))
+				local toward = pos - cur
+				learnBlock(cur + (toward.Magnitude > 0.1 and toward.Unit * 4 or Vector3.zero))
+				tw:Cancel()
+				return false
+			end
+			checkDist = nowDist
+			checkAt = os.clock() + 0.5
+		end
 	end
 	return Config.AutoFarm
 end
@@ -1082,17 +1159,216 @@ local function walkPathTo(hrp, goal, params)
 	return Config.AutoFarm
 end
 
+-- ---------- карта проходимости (сетка + A*) ----------
+-- Скрипт сам «рисует карту» вокруг маршрута: на высоте цели проверяет клетки сетки на стены
+-- и ищет путь в обход. Путь сглаживается, поэтому персонаж летит прямыми отрезками между углами.
+local farmIgnoreModel -- дверь, к которой летим (её детали не считаем стенами)
+
+local function blockingPart(inst, y)
+	if inst:IsA("Terrain") then return false end
+	if not (inst.CanCollide or (inst.Transparency < 0.95 and inst.Size.Magnitude >= 6)) then return false end
+	local m = inst:FindFirstAncestorOfClass("Model")
+	if m and m:FindFirstChildOfClass("Humanoid") then return false end -- другие игроки / NPC
+	local cf, sz = inst.CFrame, inst.Size
+	local ext = (math.abs(cf.RightVector.Y) * sz.X + math.abs(cf.UpVector.Y) * sz.Y + math.abs(cf.LookVector.Y) * sz.Z) / 2
+	if cf.Position.Y + ext < y - 0.8 then return false end -- пол / земля ниже нашей высоты
+	return true
+end
+
+local function gridRoute(startPos, goalPos)
+	local CELL = 4
+	local y = goalPos.Y
+	local s2 = Vector3.new(startPos.X, y, startPos.Z)
+	if (s2 - goalPos).Magnitude > 450 then return nil end
+
+	local params = makeRayParams()
+	if math.abs(startPos.Y - y) > 1.5 and not segmentClear(startPos, s2, params) then return nil end
+
+	local minX = math.min(s2.X, goalPos.X) - 60
+	local maxX = math.max(s2.X, goalPos.X) + 60
+	local minZ = math.min(s2.Z, goalPos.Z) - 60
+	local maxZ = math.max(s2.Z, goalPos.Z) + 60
+	local cols = math.ceil((maxX - minX) / CELL) + 1
+	local rows = math.ceil((maxZ - minZ) / CELL) + 1
+	if cols * rows > 9000 then return nil end
+
+	local function cellOf(p) return math.floor((p.X - minX) / CELL), math.floor((p.Z - minZ) / CELL) end
+	local function center(cx, cz) return Vector3.new(minX + (cx + 0.5) * CELL, y, minZ + (cz + 0.5) * CELL) end
+	local function key(cx, cz) return cx * 10000 + cz end
+
+	local filter = { LocalPlayer.Character }
+	if farmIgnoreModel then filter[#filter + 1] = farmIgnoreModel end
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = filter
+	op.RespectCanCollide = false
+
+	local sx, sz = cellOf(s2)
+	local gx, gz = cellOf(goalPos)
+	local forced = { [key(sx, sz)] = true, [key(gx, gz)] = true }
+	local cache = {}
+	local function free(cx, cz)
+		if cx < 0 or cz < 0 or cx >= cols or cz >= rows then return false end
+		local k = key(cx, cz)
+		if forced[k] then return true end
+		local v = cache[k]
+		if v ~= nil then return v end
+		local ok = not nearLearned(center(cx, cz), CELL * 0.5 + 4)
+		for _, inst in ipairs(ok and Workspace:GetPartBoundsInBox(CFrame.new(center(cx, cz)), Vector3.new(CELL + 2, 2.2, CELL + 2), op) or {}) do
+			if blockingPart(inst, y) then ok = false break end
+		end
+		cache[k] = ok
+		return ok
+	end
+
+	-- A* с бинарной кучей
+	local heap, hn = {}, 0
+	local function push(k, f)
+		hn += 1
+		heap[hn] = { k, f }
+		local i = hn
+		while i > 1 do
+			local par = i // 2
+			if heap[par][2] <= heap[i][2] then break end
+			heap[par], heap[i] = heap[i], heap[par]
+			i = par
+		end
+	end
+	local function pop()
+		local top = heap[1]
+		heap[1] = heap[hn]
+		heap[hn] = nil
+		hn -= 1
+		local i = 1
+		while true do
+			local l, r, m = i * 2, i * 2 + 1, i
+			if l <= hn and heap[l][2] < heap[m][2] then m = l end
+			if r <= hn and heap[r][2] < heap[m][2] then m = r end
+			if m == i then break end
+			heap[m], heap[i] = heap[i], heap[m]
+			i = m
+		end
+		return top[1]
+	end
+
+	local startKey, goalKey = key(sx, sz), key(gx, gz)
+	local g, came, closed = { [startKey] = 0 }, {}, {}
+	local function h(cx, cz)
+		local dx, dz = math.abs(cx - gx), math.abs(cz - gz)
+		return (dx + dz) + (1.41421 - 2) * math.min(dx, dz)
+	end
+	push(startKey, h(sx, sz))
+	local found, steps = false, 0
+	while hn > 0 do
+		local k = pop()
+		if not closed[k] then
+			closed[k] = true
+			if k == goalKey then found = true break end
+			local cx, cz = k // 10000, k % 10000
+			for dx = -1, 1 do
+				for dz = -1, 1 do
+					if dx ~= 0 or dz ~= 0 then
+						local nx, nz = cx + dx, cz + dz
+						local nk = key(nx, nz)
+						if not closed[nk] and free(nx, nz)
+							and (dx == 0 or dz == 0 or (free(cx + dx, cz) and free(cx, cz + dz))) then
+							local ng = g[k] + ((dx ~= 0 and dz ~= 0) and 1.41421 or 1)
+							if not g[nk] or ng < g[nk] then
+								g[nk] = ng
+								came[nk] = k
+								push(nk, ng + h(nx, nz))
+							end
+						end
+					end
+				end
+			end
+			steps += 1
+			if steps % 250 == 0 then task.wait() end
+			if steps > 6000 then return nil end
+		end
+	end
+	if not found then return nil end
+
+	local pts, k = {}, goalKey
+	while k do
+		table.insert(pts, 1, center(k // 10000, k % 10000))
+		k = came[k]
+	end
+	pts[1] = s2
+	pts[#pts] = goalPos
+
+	local function lineFree(a, b)
+		local d = b - a
+		local n = math.max(1, math.ceil(d.Magnitude / (CELL * 0.5)))
+		for i = 1, n - 1 do
+			local cx, cz = cellOf(a + d * (i / n))
+			if not free(cx, cz) then return false end
+		end
+		return true
+	end
+	local out, i = { s2 }, 1
+	while i < #pts do
+		local j = #pts
+		while j > i + 1 and not lineFree(pts[i], pts[j]) do j -= 1 end
+		out[#out + 1] = pts[j]
+		i = j
+	end
+	return out
+end
+
 -- безопасный полёт без ноклипа.
 -- обычный порядок: прямо -> над постройками -> по навмешу
 -- preferGround (между дверями): прямо -> по навмешу -> над постройками (только если иначе никак)
+local descending = false
 local function flyTo(goal, preferGround)
 	local _, hrp = getChar()
 	if not hrp then return false end
 	local params = makeRayParams()
 	local start = hrp.Position
 
-	if segmentClear(start, goal, params) then
+	if segmentClear(start, goal, params) and not pathHitsLearned(start, goal) then
 		return tweenTo(hrp, goal)
+	end
+
+	-- мы высоко над целью (укрытие на крыше): сначала спускаемся по ближайшей свободной вертикали
+	if start.Y - goal.Y > 5 and not descending then
+		local best, bestD
+		for _, radius in ipairs({ 0, 10, 20, 30, 45, 60 }) do
+			for deg = 0, (radius == 0 and 0 or 330), 30 do
+				local rad = math.rad(deg)
+				local p = Vector3.new(start.X + math.cos(rad) * radius, start.Y, start.Z + math.sin(rad) * radius)
+				local low = Vector3.new(p.X, goal.Y, p.Z)
+				if (radius == 0 or segmentClear(start, p, params)) and segmentClear(p, low, params) and not nearLearned(p, 6) then
+					local dd = Vector3.new(p.X - goal.X, 0, p.Z - goal.Z).Magnitude
+					if not bestD or dd < bestD then best, bestD = p, dd end
+				end
+			end
+			if best then break end -- ближайшая свободная колонна найдена
+		end
+		if best then
+			local low = Vector3.new(best.X, goal.Y, best.Z)
+			if (best - start).Magnitude > 1 and not tweenTo(hrp, best) then return false end
+			if not tweenTo(hrp, low) then return false end
+			descending = true
+			local ok = flyTo(goal, preferGround)
+			descending = false
+			return ok
+		end
+	end
+
+	-- обход стен по сетке (основной способ)
+	local okRoute, route = pcall(gridRoute, start, goal)
+	if okRoute and route then
+		if (route[1] - start).Magnitude > 1 then
+			if not tweenTo(hrp, route[1]) then return false end
+		end
+		for i = 2, #route do
+			if not Config.AutoFarm then return false end
+			if not tweenTo(hrp, route[i]) then return false end
+		end
+		return Config.AutoFarm
+	elseif not okRoute then
+		warn("[EjejHuesos Hub] ошибка построения маршрута: " .. tostring(route))
 	end
 
 	local function tryAir()
@@ -1115,6 +1391,116 @@ local function flyTo(goal, preferGround)
 	local tried, ok = tryAir()
 	if tried then return ok end
 	return walkPathTo(hrp, goal, params)
+end
+
+-- запасной вариант: идём пешком по навмешу (обычное движение сервер не откатывает)
+local function walkTo(goal)
+	local _, hrp, hum = getChar()
+	if not hrp or not hum then return false end
+	releaseFarm() -- снимаем Anchored, чтобы персонаж мог ходить
+	task.wait(0.1)
+	local params = makeRayParams()
+	local ground = groundPoint(goal, params)
+	local function near()
+		local d = hrp.Position - ground
+		return Vector3.new(d.X, 0, d.Z).Magnitude <= 6 and math.abs(d.Y) <= 14
+	end
+
+	local path = PathfindingService:CreatePath({ AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true })
+	local ok = pcall(function() path:ComputeAsync(hrp.Position, ground) end)
+	if ok and path.Status == Enum.PathStatus.Success then
+		for _, wp in ipairs(path:GetWaypoints()) do
+			if not Config.AutoFarm then return false end
+			if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+			hum:MoveTo(wp.Position)
+			local t0 = os.clock()
+			while Config.AutoFarm and os.clock() - t0 < 4 do
+				local d = hrp.Position - wp.Position
+				if Vector3.new(d.X, 0, d.Z).Magnitude <= 3 then break end
+				task.wait(0.05)
+			end
+		end
+	else
+		hum:MoveTo(ground)
+		local t0 = os.clock()
+		while Config.AutoFarm and os.clock() - t0 < 20 and not near() do task.wait(0.1) end
+	end
+	return near()
+end
+
+-- короткий прыжок через препятствие: на ~1 сек снимаем заморозку, прыгаем и шагаем в сторону цели
+-- (angleDeg поворачивает направление, чтобы не биться в одну и ту же стену)
+local function hop(goal, angleDeg)
+	local _, hrp, hum = getChar()
+	if not hrp or not hum then return end
+	setFarmStatus("обхожу препятствие")
+	releaseFarm()
+	local d = goal - hrp.Position
+	d = Vector3.new(d.X, 0, d.Z)
+	local dir = d.Magnitude > 1 and d.Unit or hrp.CFrame.LookVector
+	local rad = math.rad(angleDeg or 0)
+	dir = Vector3.new(
+		dir.X * math.cos(rad) - dir.Z * math.sin(rad),
+		0,
+		dir.X * math.sin(rad) + dir.Z * math.cos(rad)
+	)
+	local startPos = hrp.Position
+	hum:MoveTo(startPos + dir * 14)
+	local t0 = os.clock()
+	while Config.AutoFarm and os.clock() - t0 < 1.1 do
+		hum.Jump = true
+		task.wait(0.05)
+		-- уже перебрались: сдвинулись вперёд и вверх/вниз немного
+		local moved = hrp.Position - startPos
+		if Vector3.new(moved.X, 0, moved.Z).Magnitude >= 8 and os.clock() - t0 > 0.5 then break end
+	end
+end
+
+local function isGrounded(hrp)
+	local params = makeRayParams()
+	return Workspace:Raycast(hrp.Position, Vector3.new(0, -8, 0), params) ~= nil
+end
+
+-- взлёт: с земли / крыши сначала строго вверх выше бортиков и заборов, и только потом вбок
+local function liftOff(hrp)
+	if not isGrounded(hrp) then return end
+	local up = hrp.Position + Vector3.new(0, Config.LiftHeight, 0)
+	if segmentClear(hrp.Position, up, makeRayParams()) then
+		tweenTo(hrp, up)
+	end
+end
+
+-- полёт с повторами: упёрлись в стену -> сразу прыгаем через неё и снова летим к цели
+local HOP_ANGLES = { 0, 40, -40, 80, -80, 0 }
+local function flyRetry(goal, preferGround, noHop)
+	farmSpeedMul = 1
+	for attempt = 1, (noHop and 2 or #HOP_ANGLES + 1) do
+		if not Config.AutoFarm then return false end
+		local _, hrp = getChar()
+		if hrp then
+			setFarmAnchored(hrp, true)
+			liftOff(hrp)
+		end
+		if flyTo(goal, preferGround) then return true end
+		if not Config.AutoFarm then return false end
+		local _, hrpNow = getChar()
+		if noHop or not hrpNow or not isGrounded(hrpNow) then
+			-- в воздухе / у укрытия не прыгаем: просто пересчитываем маршрут
+			task.wait(0.3)
+		else
+			local angle = HOP_ANGLES[attempt]
+			if angle == nil then break end
+			hop(goal, angle) -- и сразу следующая попытка полёта
+		end
+	end
+	if noHop or not Config.AutoFarm then return false end
+	local _, hrpChk = getChar()
+	if hrpChk and not isGrounded(hrpChk) then return false end -- сверху пешком не ходим
+	warn("[EjejHuesos Hub] полёт не проходит, иду пешком")
+	local ok = walkTo(goal)
+	local _, hrp = getChar()
+	if hrp and Config.AutoFarm then setFarmAnchored(hrp, true) end
+	return ok
 end
 
 -- ---------- выбор точек ----------
@@ -1185,11 +1571,98 @@ local function giveUp(model, seconds)
 	if Config.AutoFarm then skipDoor[model] = os.clock() + seconds end
 end
 
+-- безопасная точка: высокое место (крыша / возвышенность) подальше от других игроков
+local function nearestPlayerDist(pos)
+	local best = math.huge
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and p.Character then
+			local r = p.Character:FindFirstChild("HumanoidRootPart")
+			if r then best = math.min(best, (r.Position - pos).Magnitude) end
+		end
+	end
+	return best
+end
+
+local safeSpot -- текущее укрытие
+local badSpots = {} -- точки, куда долететь не удалось
+
+local function pickSafeSpot(fromPos)
+	local params = makeRayParams()
+	local _, hrp0, hum0 = getChar()
+	local feet = (hum0 and hum0.HipHeight or 2) + (hrp0 and hrp0.Size.Y / 2 or 1) + 0.3
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = { LocalPlayer.Character }
+	op.RespectCanCollide = true
+	local best, bestScore
+	for _, radius in ipairs({ 50, 100, 160 }) do
+		for deg = 0, 330, 30 do
+			local rad = math.rad(deg)
+			local x = fromPos.X + math.cos(rad) * radius
+			local z = fromPos.Z + math.sin(rad) * radius
+			local r = Workspace:Raycast(Vector3.new(x, fromPos.Y + 300, z), Vector3.new(0, -800, 0), params)
+			if r and r.Normal.Y > 0.9 then -- только ровная поверхность (крыша / земля)
+				local m = r.Instance:FindFirstAncestorOfClass("Model")
+				if not (m and m:FindFirstChildOfClass("Humanoid")) then
+					local p = r.Position + Vector3.new(0, feet, 0) -- стоим НА поверхности
+					local bad = false
+					for _, b in ipairs(badSpots) do
+						if (b - p).Magnitude < 25 then bad = true break end
+					end
+					if not bad and #Workspace:GetPartBoundsInBox(CFrame.new(p + Vector3.new(0, 1, 0)), Vector3.new(4, 4, 4), op) == 0 then
+						-- главное: далеко от игроков; плюс бонус за высоту; ближе = чуть лучше
+						local score = math.min(nearestPlayerDist(p), 200) + (r.Position.Y - fromPos.Y) * 0.6 - radius * 0.15
+						if not bestScore or score > bestScore then best, bestScore = p, score end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- летим в укрытие и стоим там (на крыше, без прыжков)
+local function goToShelter(hrp)
+	farmIgnoreModel = nil
+	local safe = Config.SafeZone
+	if not safe then
+		-- выбираем укрытие заново, если его нет или рядом появился игрок
+		if not safeSpot or nearestPlayerDist(safeSpot) < 45 then
+			safeSpot = pickSafeSpot(hrp.Position) or lastSafe
+		end
+		safe = safeSpot
+	end
+	setFarmAnchored(hrp, true)
+	if safe and (hrp.Position - safe).Magnitude > 3 then
+		setFarmStatus("лечу в укрытие")
+		-- к укрытию летим без прыжков; если не получилось — запоминаем точку и выберем другую
+		-- к крыше подлетаем сверху (над бортиками) и опускаемся вертикально
+		local above = safe + Vector3.new(0, Config.LiftHeight, 0)
+		local arrived = flyRetry(above, false, true)
+		if arrived then
+			local _, h2 = getChar()
+			if h2 then arrived = tweenTo(h2, safe) end
+		end
+		if not arrived then
+			badSpots[#badSpots + 1] = safe
+			if #badSpots > 10 then table.remove(badSpots, 1) end
+			if safe == safeSpot then safeSpot = nil end
+			task.wait(0.5)
+		end
+	else
+		setFarmStatus("в укрытии, жду")
+		local _, _, hum = getChar()
+		if hum then hum.Jump = false end
+		task.wait(0.3)
+	end
+end
+
 task.spawn(function()
 	while true do
 		task.wait(0.1)
 		if not Config.AutoFarm then
 			if farmAnchoredHrp then releaseFarm() end
+			setFarmStatus("выключен")
 			continue
 		end
 
@@ -1202,11 +1675,13 @@ task.spawn(function()
 
 		local model, d, prompt = pickDoor(hrp)
 		if not model then
-			task.wait(0.5)
+			-- других дверей нет: в укрытие и ждём
+			goToShelter(hrp)
 			continue
 		end
 
 		setFarmAnchored(hrp, true)
+		farmIgnoreModel = model
 
 		local doorPos = promptPosition(prompt, model)
 
@@ -1220,24 +1695,14 @@ task.spawn(function()
 			return false
 		end
 
-		-- 1) на возвышенность летим ТОЛЬКО если надо ждать таймер
+		-- 1) пока таймер большой — ждём в укрытии, вылетаем только когда пора
 		local fromPos = hrp.Position
-		if doorSecondsLeft(d) > 3 then
-			local wp = pickWaitPoint(doorPos, hrp.Position)
-			if not wp then
-				giveUp(model, 20)
-				continue
-			end
-			if not flyTo(wp) then
-				giveUp(model, 10)
-				continue
-			end
-			fromPos = wp
-			if not waitReady(240) then
-				giveUp(model, 30)
-				continue
-			end
+		local travel = (doorPos - hrp.Position).Magnitude / Config.FarmSpeed + 3
+		if doorSecondsLeft(d) > travel then
+			goToShelter(hrp)
+			continue
 		end
+		farmIgnoreModel = model
 
 		-- 2) к двери (без ноклипа). Между дверями наверх не поднимаемся
 		prompt = getPrompt(model, d)
@@ -1248,10 +1713,12 @@ task.spawn(function()
 			giveUp(model, 20)
 			continue
 		end
-		if not flyTo(spot, true) then
-			giveUp(model, 10)
+		setFarmStatus("лечу к двери")
+		if not flyRetry(spot, true) then
+			giveUp(model, 3)
 			continue
 		end
+		setFarmStatus("жду таймер у двери")
 
 		-- 3) если таймер ещё не кончился — ждём у двери, потом замораживаемся и лутаем
 		if not waitReady(30) then
@@ -1259,22 +1726,27 @@ task.spawn(function()
 			continue
 		end
 
+		setFarmStatus("забираю лут")
 		local frozen = 0
 		while frozen < Config.FreezeTime and Config.AutoFarm and model.Parent do
 			task.wait(0.05)
 			frozen += 0.05
 		end
 		if model.Parent and Config.AutoFarm then
+			-- безопасную точку считаем заранее: после лута дверь может исчезнуть
+			lastSafe = pickWaitPoint(doorPos, hrp.Position) or lastSafe
 			pcall(firePrompt, prompt)
-			local waited = 0
-			while model.Parent and waited < 1.5 do
+			-- стоим на месте, пока конфеты долетят до нас
+			local t = 0
+			while t < Config.CollectTime and Config.AutoFarm do
 				task.wait(0.05)
-				waited += 0.05
+				t += 0.05
 			end
-			if model.Parent then giveUp(model, 3) end
+			-- эту дверь пропускаем, чтобы сразу лететь к следующей (или в безопасную точку)
+			skipDoor[model] = os.clock() + Config.LootedSkip
+			farmLooted += 1
+			setFarmStatus("лут собран")
 		end
-
-		task.wait(Config.FarmDelay)
 	end
 end)
 
@@ -1456,77 +1928,148 @@ gui.DisplayOrder = 100
 gui.IgnoreGuiInset = true
 gui.Parent = PlayerGui
 
+-- свечение и тень за окном
+local glow = Instance.new("Frame")
+glow.Name = "Glow"
+glow.AnchorPoint = Vector2.new(0.5, 0.5)
+glow.Size = UDim2.new(0, 575, 0, 415)
+glow.Position = UDim2.new(0.5, 0, 0.5, 0)
+glow.BackgroundColor3 = Theme.Accent
+glow.BackgroundTransparency = 0.93
+glow.BorderSizePixel = 0
+glow.Parent = gui
+corner(glow, 30)
+local glowGrad = Instance.new("UIGradient")
+glowGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Theme.AccentDark),
+	ColorSequenceKeypoint.new(0.5, Theme.Accent),
+	ColorSequenceKeypoint.new(1, Theme.AccentDark),
+})
+glowGrad.Rotation = 90
+glowGrad.Parent = glow
+
+local shadow = Instance.new("Frame")
+shadow.Name = "Shadow"
+shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+shadow.Size = UDim2.new(0, 540, 0, 380)
+shadow.Position = UDim2.new(0.5, 0, 0.5, 8)
+shadow.BackgroundColor3 = Color3.new(0, 0, 0)
+shadow.BackgroundTransparency = 0.48
+shadow.BorderSizePixel = 0
+shadow.Parent = gui
+corner(shadow, 22)
+
 local main = Instance.new("Frame")
 main.Name = "Main"
+main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Size = UDim2.new(0, 540, 0, 380)
-main.Position = UDim2.new(0.5, -270, 0.5, -190)
+main.Position = UDim2.new(0.5, 0, 0.5, 0)
 main.BackgroundColor3 = Theme.Bg
 main.BorderSizePixel = 0
+main.ClipsDescendants = true
 main.Parent = gui
-corner(main, 14)
-
-local mainStroke = stroke(main, Color3.new(1, 1, 1), 2)
-local mainGrad = Instance.new("UIGradient")
-mainGrad.Color = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Theme.Accent),
-	ColorSequenceKeypoint.new(0.5, Theme.AccentDark),
-	ColorSequenceKeypoint.new(1, Theme.Accent),
-})
-mainGrad.Rotation = 45
-mainGrad.Parent = mainStroke
+corner(main, 22)
+local mainStroke = stroke(main, Theme.VioletSoft, 1, 0.55)
 
 local scale = Instance.new("UIScale")
 scale.Parent = main
 
 local bgGrad = Instance.new("UIGradient")
-bgGrad.Color = ColorSequence.new(Color3.fromRGB(22, 14, 40), Theme.Bg)
+bgGrad.Color = ColorSequence.new(Color3.fromRGB(23, 12, 42), Theme.Bg)
 bgGrad.Rotation = 90
 bgGrad.Parent = main
+
+-- свечение и тень следуют за окном (перетаскивание, показ / скрытие)
+local function syncBack()
+	glow.Position = main.Position
+	shadow.Position = main.Position + UDim2.new(0, 0, 0, 8)
+	glow.Visible = main.Visible
+	shadow.Visible = main.Visible
+end
+main:GetPropertyChangedSignal("Position"):Connect(syncBack)
+main:GetPropertyChangedSignal("Visible"):Connect(syncBack)
+
+-- неоновая линия под шапкой
+local edge = Instance.new("Frame")
+edge.Name = "Edge"
+edge.Position = UDim2.new(0, 18, 0, 68)
+edge.Size = UDim2.new(1, -36, 0, 1)
+edge.BackgroundColor3 = Theme.Accent
+edge.BorderSizePixel = 0
+edge.Parent = main
+local edgeGrad = Instance.new("UIGradient")
+edgeGrad.Transparency = NumberSequence.new({
+	NumberSequenceKeypoint.new(0, 0.85),
+	NumberSequenceKeypoint.new(0.5, 0),
+	NumberSequenceKeypoint.new(1, 0.85),
+})
+edgeGrad.Parent = edge
 
 -- шапка
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, -20, 0, 54)
-header.Position = UDim2.new(0, 10, 0, 10)
-header.BackgroundColor3 = Theme.Panel
+header.Position = UDim2.new(0, 10, 0, 8)
+header.BackgroundTransparency = 1
+header.Active = true
 header.BorderSizePixel = 0
 header.Parent = main
-corner(header, 10)
-stroke(header, Theme.Stroke, 1, 0.3)
+
+local logoGlow = Instance.new("Frame")
+logoGlow.Size = UDim2.new(0, 43, 0, 43)
+logoGlow.Position = UDim2.new(0, 8, 0.5, -21)
+logoGlow.BackgroundColor3 = Theme.Accent
+logoGlow.BackgroundTransparency = 0.8
+logoGlow.BorderSizePixel = 0
+logoGlow.Parent = header
+corner(logoGlow, 13)
 
 local logo = Instance.new("Frame")
-logo.Size = UDim2.new(0, 36, 0, 36)
-logo.Position = UDim2.new(0, 10, 0.5, -18)
-logo.BackgroundColor3 = Theme.Accent
+logo.Size = UDim2.new(0, 39, 0, 39)
+logo.Position = UDim2.new(0, 10, 0.5, -19)
+logo.BackgroundColor3 = Theme.AccentDark
+logo.BorderSizePixel = 0
 logo.Parent = header
-corner(logo, 18)
+corner(logo, 12)
+stroke(logo, Theme.Accent, 1, 0.32)
 local logoGrad = Instance.new("UIGradient")
-logoGrad.Color = ColorSequence.new(Color3.fromRGB(200, 120, 255), Theme.AccentDark)
-logoGrad.Rotation = 135
+logoGrad.Color = ColorSequence.new(Theme.Accent, Theme.AccentDark)
+logoGrad.Rotation = 45
 logoGrad.Parent = logo
 
 local logoBolt = Instance.new("TextLabel")
 logoBolt.Size = UDim2.new(1, 0, 1, 0)
 logoBolt.BackgroundTransparency = 1
-logoBolt.Text = "⚡"
-logoBolt.TextSize = 20
-logoBolt.TextColor3 = Color3.new(1, 1, 1)
-logoBolt.Font = Enum.Font.GothamBold
+logoBolt.Text = "E"
+logoBolt.TextSize = 21
+logoBolt.TextColor3 = Theme.Text
+logoBolt.Font = Enum.Font.GothamBlack
 logoBolt.Parent = logo
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(0, 220, 1, 0)
-title.Position = UDim2.new(0, 56, 0, 0)
+title.Size = UDim2.new(1, -140, 0, 24)
+title.Position = UDim2.new(0, 64, 0, 7)
 title.BackgroundTransparency = 1
-title.Text = "EjejHuesos Hub"
+title.Text = "EJEJHUESOS HUB"
 title.TextColor3 = Theme.Text
-title.TextSize = 19
-title.Font = Enum.Font.GothamBlack
+title.TextSize = 16
+title.Font = Enum.Font.GothamBold
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = header
 
+local subtitle = Instance.new("TextLabel")
+subtitle.Size = UDim2.new(1, -150, 0, 18)
+subtitle.Position = UDim2.new(0, 65, 0, 31)
+subtitle.BackgroundTransparency = 1
+subtitle.Text = "FARM  •  ESP  •  FLY"
+subtitle.TextColor3 = Theme.Lavender
+subtitle.TextSize = 9
+subtitle.Font = Enum.Font.GothamMedium
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Parent = header
+
 local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.new(0, 34, 0, 34)
-minBtn.Position = UDim2.new(1, -44, 0.5, -17)
+minBtn.Size = UDim2.new(0, 31, 0, 31)
+minBtn.Position = UDim2.new(1, -41, 0.5, -15)
 minBtn.BackgroundColor3 = Theme.Item
 minBtn.Text = "—"
 minBtn.TextColor3 = Theme.SubText
@@ -1534,22 +2077,24 @@ minBtn.TextSize = 16
 minBtn.Font = Enum.Font.GothamBold
 minBtn.AutoButtonColor = false
 minBtn.Parent = header
-corner(minBtn, 8)
-minBtn.MouseEnter:Connect(function() tween(minBtn, { BackgroundColor3 = Theme.AccentDark }) end)
-minBtn.MouseLeave:Connect(function() tween(minBtn, { BackgroundColor3 = Theme.Item }) end)
+corner(minBtn, 9)
+stroke(minBtn, Theme.VioletSoft, 1, 0.65)
+minBtn.MouseEnter:Connect(function() tween(minBtn, { BackgroundColor3 = Theme.AccentDark, TextColor3 = Theme.Text }, 0.14) end)
+minBtn.MouseLeave:Connect(function() tween(minBtn, { BackgroundColor3 = Theme.Item, TextColor3 = Theme.SubText }, 0.14) end)
 
 -- сайдбар
 local sidebar = Instance.new("Frame")
 sidebar.Size = UDim2.new(0, 130, 1, -84)
 sidebar.Position = UDim2.new(0, 10, 0, 74)
 sidebar.BackgroundColor3 = Theme.Panel
+sidebar.BackgroundTransparency = 0.15
 sidebar.BorderSizePixel = 0
 sidebar.Parent = main
-corner(sidebar, 10)
-stroke(sidebar, Theme.Stroke, 1, 0.3)
+corner(sidebar, 12)
+stroke(sidebar, Theme.Stroke, 1, 0.2)
 
 local sideLayout = Instance.new("UIListLayout")
-sideLayout.Padding = UDim.new(0, 6)
+sideLayout.Padding = UDim.new(0, 5)
 sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
 sideLayout.Parent = sidebar
 local sidePad = Instance.new("UIPadding")
@@ -1562,10 +2107,11 @@ local contentHolder = Instance.new("Frame")
 contentHolder.Size = UDim2.new(1, -160, 1, -84)
 contentHolder.Position = UDim2.new(0, 150, 0, 74)
 contentHolder.BackgroundColor3 = Theme.Panel
+contentHolder.BackgroundTransparency = 0.15
 contentHolder.BorderSizePixel = 0
 contentHolder.Parent = main
-corner(contentHolder, 10)
-stroke(contentHolder, Theme.Stroke, 1, 0.3)
+corner(contentHolder, 12)
+stroke(contentHolder, Theme.Stroke, 1, 0.2)
 
 -- вкладки
 local tabs = {}
@@ -1573,12 +2119,13 @@ local tabs = {}
 local function selectTab(name)
 	for n, t in pairs(tabs) do
 		local active = n == name
+		t.active = active
 		t.page.Visible = active
 		tween(t.btn, {
 			BackgroundTransparency = active and 0 or 1,
 			BackgroundColor3 = active and Theme.AccentDark or Theme.Item,
-		})
-		t.label.TextColor3 = active and Color3.new(1, 1, 1) or Theme.SubText
+		}, 0.16)
+		tween(t.label, { TextColor3 = active and Theme.Text or Theme.SubText }, 0.16)
 		t.bar.Visible = active
 	end
 end
@@ -1597,7 +2144,7 @@ local function addTab(name, icon, order)
 	local bar = Instance.new("Frame")
 	bar.Size = UDim2.new(0, 3, 0.6, 0)
 	bar.Position = UDim2.new(0, 0, 0.2, 0)
-	bar.BackgroundColor3 = Color3.fromRGB(220, 170, 255)
+	bar.BackgroundColor3 = Theme.Lavender
 	bar.BorderSizePixel = 0
 	bar.Visible = false
 	bar.Parent = btn
@@ -1609,7 +2156,7 @@ local function addTab(name, icon, order)
 	label.BackgroundTransparency = 1
 	label.Text = icon .. "  " .. name
 	label.TextColor3 = Theme.SubText
-	label.TextSize = 14
+	label.TextSize = 13
 	label.Font = Enum.Font.GothamBold
 	label.TextXAlignment = Enum.TextXAlignment.Left
 	label.Parent = btn
@@ -1633,6 +2180,12 @@ local function addTab(name, icon, order)
 
 	tabs[name] = { btn = btn, page = page, label = label, bar = bar }
 	btn.MouseButton1Click:Connect(function() selectTab(name) end)
+	btn.MouseEnter:Connect(function()
+		if not tabs[name].active then tween(btn, { BackgroundTransparency = 0.6, BackgroundColor3 = Theme.Item }, 0.14) end
+	end)
+	btn.MouseLeave:Connect(function()
+		if not tabs[name].active then tween(btn, { BackgroundTransparency = 1 }, 0.14) end
+	end)
 	return page
 end
 
@@ -1642,8 +2195,8 @@ local function addSection(page, text, order)
 	l.Size = UDim2.new(1, 0, 0, 18)
 	l.BackgroundTransparency = 1
 	l.Text = text
-	l.TextColor3 = Theme.Accent
-	l.TextSize = 12
+	l.TextColor3 = Theme.Lavender
+	l.TextSize = 11
 	l.Font = Enum.Font.GothamBold
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.LayoutOrder = order
@@ -1678,7 +2231,7 @@ local function addToggle(page, icon, text, initial, order, callback)
 	lbl.Text = text
 	lbl.TextColor3 = Theme.Text
 	lbl.TextSize = 14
-	lbl.Font = Enum.Font.GothamSemibold
+	lbl.Font = Enum.Font.GothamMedium
 	lbl.TextXAlignment = Enum.TextXAlignment.Left
 	lbl.Parent = row
 
@@ -1707,8 +2260,8 @@ local function addToggle(page, icon, text, initial, order, callback)
 		callback(state)
 	end
 
-	row.MouseEnter:Connect(function() tween(rowStroke, { Transparency = 0.1 }) end)
-	row.MouseLeave:Connect(function() tween(rowStroke, { Transparency = 0.5 }) end)
+	row.MouseEnter:Connect(function() tween(rowStroke, { Transparency = 0.1, Color = Theme.Accent }) end)
+	row.MouseLeave:Connect(function() tween(rowStroke, { Transparency = 0.5, Color = Theme.Stroke }) end)
 	row.MouseButton1Click:Connect(function() apply(not state) end)
 
 	return { Set = apply }
@@ -1730,7 +2283,7 @@ local function addSlider(page, text, min, max, step, initial, order, callback)
 	lbl.Text = text
 	lbl.TextColor3 = Theme.Text
 	lbl.TextSize = 14
-	lbl.Font = Enum.Font.GothamSemibold
+	lbl.Font = Enum.Font.GothamMedium
 	lbl.TextXAlignment = Enum.TextXAlignment.Left
 	lbl.Parent = row
 
@@ -1839,7 +2392,7 @@ local function addKeybind(page, icon, text, initial, order, callback)
 	lbl.Text = text
 	lbl.TextColor3 = Theme.Text
 	lbl.TextSize = 14
-	lbl.Font = Enum.Font.GothamSemibold
+	lbl.Font = Enum.Font.GothamMedium
 	lbl.TextXAlignment = Enum.TextXAlignment.Left
 	lbl.Parent = row
 
@@ -1903,12 +2456,12 @@ local function addButton(page, icon, text, order, callback)
 	lbl.Text = text
 	lbl.TextColor3 = Theme.Text
 	lbl.TextSize = 14
-	lbl.Font = Enum.Font.GothamSemibold
+	lbl.Font = Enum.Font.GothamMedium
 	lbl.TextXAlignment = Enum.TextXAlignment.Left
 	lbl.Parent = row
 
-	row.MouseEnter:Connect(function() tween(rowStroke, { Transparency = 0.1 }) end)
-	row.MouseLeave:Connect(function() tween(rowStroke, { Transparency = 0.5 }) end)
+	row.MouseEnter:Connect(function() tween(rowStroke, { Transparency = 0.1, Color = Theme.Accent }) end)
+	row.MouseLeave:Connect(function() tween(rowStroke, { Transparency = 0.5, Color = Theme.Stroke }) end)
 	row.MouseButton1Click:Connect(callback)
 end
 
@@ -1952,19 +2505,32 @@ addSection(pageMisc, "MISC", 0)
 addSlider(pageMisc, "Farm Delay (сек)", 0.1, 2, 0.05, Config.FarmDelay, 1, function(v) Config.FarmDelay = v end)
 addSlider(pageMisc, "Wait Radius (до двери)", 50, 100, 5, Config.WaitRadius, 2, function(v) Config.WaitRadius = v end)
 addSlider(pageMisc, "Farm Speed", 40, 300, 10, Config.FarmSpeed, 3, function(v) Config.FarmSpeed = v end)
+addSlider(pageMisc, "Collect Time (сек у двери)", 0, 5, 0.5, Config.CollectTime, 4, function(v) Config.CollectTime = v end)
 local hint = Instance.new("TextLabel")
 hint.Size = UDim2.new(1, -4, 0, 56)
 hint.BackgroundColor3 = Theme.Item
 hint.TextColor3 = Theme.SubText
 hint.TextSize = 13
 hint.Font = Enum.Font.Gotham
-hint.LayoutOrder = 4
+hint.LayoutOrder = 5
 hint.Parent = pageMisc
 corner(hint, 9)
 updateHint = function()
 	hint.Text = "RightShift — меню\n" .. Config.FlyKey.Name .. " — полёт   Space / Ctrl — вверх / вниз"
 end
 updateHint()
+
+farmStatusLabel = Instance.new("TextLabel")
+farmStatusLabel.Size = UDim2.new(1, -4, 0, 44)
+farmStatusLabel.BackgroundColor3 = Theme.Item
+farmStatusLabel.TextColor3 = Theme.SubText
+farmStatusLabel.TextSize = 12
+farmStatusLabel.Font = Enum.Font.GothamMedium
+farmStatusLabel.LayoutOrder = 20
+farmStatusLabel.Text = ""
+farmStatusLabel.Parent = pageMain
+corner(farmStatusLabel, 9)
+setFarmStatus()
 
 selectTab("Main")
 
@@ -1997,8 +2563,8 @@ local ball = Instance.new("TextButton")
 ball.Name = "Ball"
 ball.Size = UDim2.new(0, 48, 0, 48)
 ball.Position = UDim2.new(0, 30, 0.5, 0)
-ball.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
-ball.Text = "⚡"
+ball.BackgroundColor3 = Theme.AccentDark
+ball.Text = "E"
 ball.TextColor3 = Color3.new(1, 1, 1)
 ball.TextSize = 26
 ball.Font = Enum.Font.GothamBold
@@ -2006,7 +2572,9 @@ ball.AutoButtonColor = false
 ball.Visible = false
 ball.Parent = gui
 corner(ball, 24)
-stroke(ball, Color3.new(1, 1, 1), 2)
+stroke(ball, Theme.Lavender, 2, 0.2)
+ball.MouseEnter:Connect(function() tween(ball, { BackgroundColor3 = Theme.Accent }, 0.14) end)
+ball.MouseLeave:Connect(function() tween(ball, { BackgroundColor3 = Theme.AccentDark }, 0.14) end)
 
 local ballMoved = false
 makeDraggable(ball, ball, function() ballMoved = true end)
@@ -2024,7 +2592,9 @@ local function setMenu(open)
 		main.Visible = true
 		ball.Visible = false
 		scale.Scale = 0.9
-		tween(scale, { Scale = 1 }, 0.2)
+		glow.BackgroundTransparency = 1
+		TweenService:Create(scale, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+		tween(glow, { BackgroundTransparency = 0.93 }, 0.4)
 	else
 		tween(scale, { Scale = 0.9 }, 0.12)
 		task.delay(0.12, function()
@@ -2059,5 +2629,69 @@ if Config.Fly then
 		applyFly()
 	end)
 end
+
+-- ---------- декор: искры и пульсация (только визуал) ----------
+local function spawnSparkle(index)
+	local sparkle = Instance.new("TextLabel")
+	sparkle.Name = "Sparkle_" .. index
+	sparkle.AnchorPoint = Vector2.new(0.5, 0.5)
+	sparkle.Position = UDim2.fromScale(math.random(5, 95) / 100, math.random(5, 95) / 100)
+	sparkle.Size = UDim2.fromOffset(12, 12)
+	sparkle.BackgroundTransparency = 1
+	sparkle.Text = index % 3 == 0 and "✧" or "✦"
+	sparkle.TextColor3 = Theme.Lavender
+	sparkle.TextTransparency = 0.2
+	sparkle.Font = Enum.Font.GothamBold
+	sparkle.TextSize = math.random(8, 13)
+	sparkle.ZIndex = 0
+	sparkle.Parent = main
+
+	task.spawn(function()
+		local startPos = sparkle.Position
+		local function sine(t) return TweenInfo.new(t, Enum.EasingStyle.Sine) end
+		while gui.Parent and sparkle.Parent do
+			if main.Visible then
+				sparkle.Rotation = math.random(-20, 20)
+				local t1 = math.random(7, 12) / 10
+				TweenService:Create(sparkle, sine(t1), {
+					TextTransparency = 0.78,
+					Position = startPos + UDim2.fromOffset(math.random(-5, 5), math.random(-8, 8)),
+				}):Play()
+				task.wait(t1)
+				local t2 = math.random(7, 12) / 10
+				TweenService:Create(sparkle, sine(t2), { TextTransparency = 0.18, Position = startPos }):Play()
+				task.wait(t2 + math.random(5, 10) / 10)
+			else
+				task.wait(0.5)
+			end
+		end
+	end)
+end
+for i = 1, 9 do spawnSparkle(i) end
+
+local function breathe(obj, prop, a, b, t, startDelay)
+	task.spawn(function()
+		task.wait(startDelay or 0)
+		local info = TweenInfo.new(t, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+		local toB = true
+		while gui.Parent do
+			if main.Visible then
+				TweenService:Create(obj, info, { [prop] = toB and b or a }):Play()
+				toB = not toB
+			end
+			task.wait(t)
+		end
+	end)
+end
+breathe(glow, "BackgroundTransparency", 0.94, 0.89, 1.8, 0.8)
+breathe(edge, "BackgroundTransparency", 0.7, 0.15, 1.1, 0)
+
+-- входная анимация
+scale.Scale = 0.9
+glow.BackgroundTransparency = 1
+shadow.BackgroundTransparency = 1
+TweenService:Create(scale, TweenInfo.new(0.55, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+tween(glow, { BackgroundTransparency = 0.93 }, 0.65)
+tween(shadow, { BackgroundTransparency = 0.48 }, 0.55)
 
 print("[EjejHuesos Hub] loaded")
