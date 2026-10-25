@@ -41,7 +41,8 @@ local Config = {
 	LiftHeight = 12,     -- на сколько стадов поднимаемся вертикально с земли / крыши (чтобы перелететь бортики)
 	CollectTime = 2,     -- сколько секунд стоим у двери после лута, чтобы забрать конфеты
 	LootedSkip = 8,      -- сколько секунд не возвращаемся к только что залутанной двери
-	SafeZone = nil,      -- своя безопасная точка, например Vector3.new(0, 300, 0); nil = скрипт сам выбирает высокое место подальше от игроков
+	SafeZone = nil,      -- своя безопасная точка, например Vector3.new(0, 300, 0); nil = ищем игровую SafeZone, иначе крышу подальше от игроков
+	UseGameSafeZone = true, -- если в карте есть деталь с именем SafeZone — прячемся там
 	FreezeTime = 1,      -- сколько секунд стоим заморожены у двери перед лутом
 	PromptRange = 60,
 	DoorName = "HalloweenDoor",
@@ -900,7 +901,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- AUTO FARM DOORS (без ноклипа)
+-- AUTO FARM DOORS (без ноклипа, без ходьбы и прыжков: здания обходим сверху твином)
 -- 1) выбираем самую высокую (возвышенность) точку ожидания на кольце WaitRadius
 -- 2) твином летим туда, ждём конец таймера
 -- 3) твином летим к свободной точке рядом с дверью, 1 сек стоим, лутаем
@@ -1316,6 +1317,38 @@ local function gridRoute(startPos, goalPos)
 	return out
 end
 
+-- перелёт над зданием вместо прыжков: строго вверх -> вбок на высоте выше крыш -> вниз.
+-- Всё твином. Если сверху навес / потолок — пробуем соседние колонки подъёма и чуть более высокие эшелоны.
+-- Возвращает (нашли ли маршрут, долетели ли).
+local function overFly(hrp, goal, params)
+	local start = hrp.Position
+	local base = cruiseY(start, goal, params)
+	local ceilingY = math.max(start.Y, goal.Y) + 220 -- выше не лезем (потолки карты / античит)
+	local offsets = {
+		Vector3.zero, Vector3.new(10, 0, 0), Vector3.new(-10, 0, 0),
+		Vector3.new(0, 0, 10), Vector3.new(0, 0, -10),
+	}
+	for _, extra in ipairs({ 0, 30, 70 }) do
+		local y = base + extra
+		if y > ceilingY then break end
+		for _, off in ipairs(offsets) do
+			if not Config.AutoFarm then return false, false end
+			local s0 = start + off
+			local p1 = Vector3.new(s0.X, y, s0.Z)
+			local p2 = Vector3.new(goal.X, y, goal.Z)
+			if (off == Vector3.zero or segmentClear(start, s0, params))
+				and segmentClear(s0, p1, params)
+				and segmentClear(p1, p2, params)
+				and segmentClear(p2, goal, params)
+				and not nearLearned(p1, 6) then
+				if off ~= Vector3.zero and not tweenTo(hrp, s0) then return true, false end
+				return true, (tweenTo(hrp, p1) and tweenTo(hrp, p2) and tweenTo(hrp, goal))
+			end
+		end
+	end
+	return false, false
+end
+
 -- безопасный полёт без ноклипа.
 -- обычный порядок: прямо -> над постройками -> по навмешу
 -- preferGround (между дверями): прямо -> по навмешу -> над постройками (только если иначе никак)
@@ -1371,89 +1404,16 @@ local function flyTo(goal, preferGround)
 		warn("[EjejHuesos Hub] ошибка построения маршрута: " .. tostring(route))
 	end
 
-	local function tryAir()
-		local y = cruiseY(start, goal, params)
-		local p1 = Vector3.new(start.X, y, start.Z)
-		local p2 = Vector3.new(goal.X, y, goal.Z)
-		if segmentClear(start, p1, params) and segmentClear(p1, p2, params) and segmentClear(p2, goal, params) then
-			return true, tweenTo(hrp, p1) and tweenTo(hrp, p2) and tweenTo(hrp, goal)
-		end
-		return false, false
-	end
-
 	if preferGround then
 		if walkPathTo(hrp, goal, params) then return true end
 		if not Config.AutoFarm then return false end
-		local _, ok = tryAir()
+		local _, ok = overFly(hrp, goal, params)
 		return ok
 	end
 
-	local tried, ok = tryAir()
+	local tried, ok = overFly(hrp, goal, params)
 	if tried then return ok end
 	return walkPathTo(hrp, goal, params)
-end
-
--- запасной вариант: идём пешком по навмешу (обычное движение сервер не откатывает)
-local function walkTo(goal)
-	local _, hrp, hum = getChar()
-	if not hrp or not hum then return false end
-	releaseFarm() -- снимаем Anchored, чтобы персонаж мог ходить
-	task.wait(0.1)
-	local params = makeRayParams()
-	local ground = groundPoint(goal, params)
-	local function near()
-		local d = hrp.Position - ground
-		return Vector3.new(d.X, 0, d.Z).Magnitude <= 6 and math.abs(d.Y) <= 14
-	end
-
-	local path = PathfindingService:CreatePath({ AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true })
-	local ok = pcall(function() path:ComputeAsync(hrp.Position, ground) end)
-	if ok and path.Status == Enum.PathStatus.Success then
-		for _, wp in ipairs(path:GetWaypoints()) do
-			if not Config.AutoFarm then return false end
-			if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
-			hum:MoveTo(wp.Position)
-			local t0 = os.clock()
-			while Config.AutoFarm and os.clock() - t0 < 4 do
-				local d = hrp.Position - wp.Position
-				if Vector3.new(d.X, 0, d.Z).Magnitude <= 3 then break end
-				task.wait(0.05)
-			end
-		end
-	else
-		hum:MoveTo(ground)
-		local t0 = os.clock()
-		while Config.AutoFarm and os.clock() - t0 < 20 and not near() do task.wait(0.1) end
-	end
-	return near()
-end
-
--- короткий прыжок через препятствие: на ~1 сек снимаем заморозку, прыгаем и шагаем в сторону цели
--- (angleDeg поворачивает направление, чтобы не биться в одну и ту же стену)
-local function hop(goal, angleDeg)
-	local _, hrp, hum = getChar()
-	if not hrp or not hum then return end
-	setFarmStatus("обхожу препятствие")
-	releaseFarm()
-	local d = goal - hrp.Position
-	d = Vector3.new(d.X, 0, d.Z)
-	local dir = d.Magnitude > 1 and d.Unit or hrp.CFrame.LookVector
-	local rad = math.rad(angleDeg or 0)
-	dir = Vector3.new(
-		dir.X * math.cos(rad) - dir.Z * math.sin(rad),
-		0,
-		dir.X * math.sin(rad) + dir.Z * math.cos(rad)
-	)
-	local startPos = hrp.Position
-	hum:MoveTo(startPos + dir * 14)
-	local t0 = os.clock()
-	while Config.AutoFarm and os.clock() - t0 < 1.1 do
-		hum.Jump = true
-		task.wait(0.05)
-		-- уже перебрались: сдвинулись вперёд и вверх/вниз немного
-		local moved = hrp.Position - startPos
-		if Vector3.new(moved.X, 0, moved.Z).Magnitude >= 8 and os.clock() - t0 > 0.5 then break end
-	end
 end
 
 local function isGrounded(hrp)
@@ -1470,11 +1430,11 @@ local function liftOff(hrp)
 	end
 end
 
--- полёт с повторами: упёрлись в стену -> сразу прыгаем через неё и снова летим к цели
-local HOP_ANGLES = { 0, 40, -40, 80, -80, 0 }
+-- полёт с повторами. Пешком не ходим и не прыгаем: упёрлись — пересчитываем маршрут
+-- (место срыва запоминается и обходится), летим чуть медленнее; здания обходим сверху твином (overFly).
 local function flyRetry(goal, preferGround, noHop)
 	farmSpeedMul = 1
-	for attempt = 1, (noHop and 2 or #HOP_ANGLES + 1) do
+	for _ = 1, (noHop and 2 or 4) do
 		if not Config.AutoFarm then return false end
 		local _, hrp = getChar()
 		if hrp then
@@ -1483,49 +1443,13 @@ local function flyRetry(goal, preferGround, noHop)
 		end
 		if flyTo(goal, preferGround) then return true end
 		if not Config.AutoFarm then return false end
-		local _, hrpNow = getChar()
-		if noHop or not hrpNow or not isGrounded(hrpNow) then
-			-- в воздухе / у укрытия не прыгаем: просто пересчитываем маршрут
-			task.wait(0.3)
-		else
-			local angle = HOP_ANGLES[attempt]
-			if angle == nil then break end
-			hop(goal, angle) -- и сразу следующая попытка полёта
-		end
+		farmSpeedMul = math.max(0.6, farmSpeedMul - 0.1)
+		task.wait(0.3)
 	end
-	if noHop or not Config.AutoFarm then return false end
-	local _, hrpChk = getChar()
-	if hrpChk and not isGrounded(hrpChk) then return false end -- сверху пешком не ходим
-	warn("[EjejHuesos Hub] полёт не проходит, иду пешком")
-	local ok = walkTo(goal)
-	local _, hrp = getChar()
-	if hrp and Config.AutoFarm then setFarmAnchored(hrp, true) end
-	return ok
+	return false
 end
 
 -- ---------- выбор точек ----------
--- точка ожидания: на кольце WaitRadius выбираем самую ВЫСОКУЮ свободную (возвышенность)
-local function pickWaitPoint(doorPos, fromPos)
-	local params = makeRayParams()
-	local best, bestScore
-	for deg = 0, 330, 30 do
-		local rad = math.rad(deg)
-		local x = doorPos.X + math.cos(rad) * Config.WaitRadius
-		local z = doorPos.Z + math.sin(rad) * Config.WaitRadius
-		local r = Workspace:Raycast(Vector3.new(x, doorPos.Y + 60, z), Vector3.new(0, -220, 0), params)
-		if r then
-			local p = Vector3.new(x, r.Position.Y + Config.WaitHeight, z)
-			if pointFree(p) then
-				local score = r.Position.Y - (p - fromPos).Magnitude / 1000 -- главное высота, потом близость
-				if not bestScore or score > bestScore then
-					best, bestScore = p, score
-				end
-			end
-		end
-	end
-	return best
-end
-
 -- точка у двери: свободная, с землёй под ногами и прямой видимостью на дверь
 local function pickDoorSpot(model, doorPos, fromPos)
 	local params = makeRayParams()
@@ -1584,8 +1508,41 @@ local function nearestPlayerDist(pos)
 end
 
 local safeSpot -- текущее укрытие
+local airSpot -- запасное укрытие: просто вверх над текущим местом (если ничего лучше не нашлось)
 local badSpots = {} -- точки, куда долететь не удалось
 
+-- игровая безопасная зона: деталь с именем SafeZone / Safe Zone / safe_zone (ищем один раз)
+local gameSafeZone
+local gameSafeZoneSearched = false
+local function gameSafeZonePoint()
+	if not (gameSafeZone and gameSafeZone.Parent) then
+		if gameSafeZoneSearched then return nil end
+		gameSafeZoneSearched = true
+		for _, o in ipairs(Workspace:GetDescendants()) do
+			if o:IsA("BasePart") then
+				local n = (o.Name:lower():gsub("[%s_%-]", ""))
+				if n == "safezone" then
+					gameSafeZone = o
+					warn("[EjejHuesos Hub] найдена безопасная зона: " .. o:GetFullName())
+					break
+				end
+			end
+		end
+		if not gameSafeZone then return nil end
+	end
+	local _, hrp0, hum0 = getChar()
+	local feet = (hum0 and hum0.HipHeight or 2) + (hrp0 and hrp0.Size.Y / 2 or 1) + 0.3
+	local c, sz = gameSafeZone.Position, gameSafeZone.Size
+	local r = Workspace:Raycast(c + Vector3.new(0, sz.Y / 2 + 1, 0), Vector3.new(0, -sz.Y - 300, 0), makeRayParams())
+	local p = (r and r.Position or c) + Vector3.new(0, feet, 0)
+	for _, b in ipairs(badSpots) do
+		if (b - p).Magnitude < 25 then return nil end -- сюда уже не долетели
+	end
+	return p
+end
+
+-- крыша / возвышенность подальше от игроков. Улицу (землю) выбираем только если крыш вообще нет:
+-- на улице убивают.
 local function pickSafeSpot(fromPos)
 	local params = makeRayParams()
 	local _, hrp0, hum0 = getChar()
@@ -1594,7 +1551,7 @@ local function pickSafeSpot(fromPos)
 	op.FilterType = Enum.RaycastFilterType.Exclude
 	op.FilterDescendantsInstances = { LocalPlayer.Character }
 	op.RespectCanCollide = true
-	local best, bestScore
+	local cands, minY = {}, math.huge
 	for _, radius in ipairs({ 50, 100, 160 }) do
 		for deg = 0, 330, 30 do
 			local rad = math.rad(deg)
@@ -1610,21 +1567,36 @@ local function pickSafeSpot(fromPos)
 						if (b - p).Magnitude < 25 then bad = true break end
 					end
 					if not bad and #Workspace:GetPartBoundsInBox(CFrame.new(p + Vector3.new(0, 1, 0)), Vector3.new(4, 4, 4), op) == 0 then
-						-- главное: далеко от игроков; плюс бонус за высоту; ближе = чуть лучше
-						local score = math.min(nearestPlayerDist(p), 200) + (r.Position.Y - fromPos.Y) * 0.6 - radius * 0.15
-						if not bestScore or score > bestScore then best, bestScore = p, score end
+						cands[#cands + 1] = { p = p, y = r.Position.Y, radius = radius, dist = nearestPlayerDist(p) }
+						minY = math.min(minY, r.Position.Y)
 					end
 				end
 			end
 		end
 	end
-	return best
+	if #cands == 0 then return nil end
+
+	local function best(minElev)
+		local bp, bs
+		for _, c in ipairs(cands) do
+			local elev = c.y - minY -- высота над уличным уровнем
+			if elev >= minElev then
+				local score = math.min(c.dist, 150) + elev * 0.8 - c.radius * 0.15
+				if not bs or score > bs then bp, bs = c.p, score end
+			end
+		end
+		return bp
+	end
+	return best(12) or best(0) -- сначала настоящие крыши (выше улицы минимум на 12), потом что угодно
 end
 
--- летим в укрытие и стоим там (на крыше, без прыжков)
+-- летим в укрытие и стоим там (без прыжков и без ходьбы)
 local function goToShelter(hrp)
 	farmIgnoreModel = nil
 	local safe = Config.SafeZone
+	if not safe and Config.UseGameSafeZone then
+		safe = gameSafeZonePoint()
+	end
 	if not safe then
 		-- выбираем укрытие заново, если его нет или рядом появился игрок
 		if not safeSpot or nearestPlayerDist(safeSpot) < 45 then
@@ -1632,10 +1604,19 @@ local function goToShelter(hrp)
 		end
 		safe = safeSpot
 	end
+	if not safe then
+		-- крыш не нашлось: хотя бы поднимаемся вверх, а не стоим на улице
+		if not airSpot then
+			local up = hrp.Position + Vector3.new(0, 40, 0)
+			if segmentClear(hrp.Position, up, makeRayParams()) then airSpot = up end
+		end
+		safe = airSpot
+	else
+		airSpot = nil
+	end
 	setFarmAnchored(hrp, true)
 	if safe and (hrp.Position - safe).Magnitude > 3 then
 		setFarmStatus("лечу в укрытие")
-		-- к укрытию летим без прыжков; если не получилось — запоминаем точку и выберем другую
 		-- к крыше подлетаем сверху (над бортиками) и опускаемся вертикально
 		local above = safe + Vector3.new(0, Config.LiftHeight, 0)
 		local arrived = flyRetry(above, false, true)
@@ -1643,10 +1624,12 @@ local function goToShelter(hrp)
 			local _, h2 = getChar()
 			if h2 then arrived = tweenTo(h2, safe) end
 		end
-		if not arrived then
+		if not arrived and Config.AutoFarm then
+			warn("[EjejHuesos Hub] не долетел до укрытия, выберу другое")
 			badSpots[#badSpots + 1] = safe
 			if #badSpots > 10 then table.remove(badSpots, 1) end
 			if safe == safeSpot then safeSpot = nil end
+			if safe == airSpot then airSpot = nil end
 			task.wait(0.5)
 		end
 	else
@@ -1715,6 +1698,8 @@ task.spawn(function()
 		end
 		setFarmStatus("лечу к двери")
 		if not flyRetry(spot, true) then
+			warn("[EjejHuesos Hub] не долетел до двери, пропускаю её на 3 сек")
+			setFarmStatus("не долететь до двери")
 			giveUp(model, 3)
 			continue
 		end
@@ -1734,7 +1719,7 @@ task.spawn(function()
 		end
 		if model.Parent and Config.AutoFarm then
 			-- безопасную точку считаем заранее: после лута дверь может исчезнуть
-			lastSafe = pickWaitPoint(doorPos, hrp.Position) or lastSafe
+			lastSafe = pickSafeSpot(doorPos) or lastSafe
 			pcall(firePrompt, prompt)
 			-- стоим на месте, пока конфеты долетят до нас
 			local t = 0
